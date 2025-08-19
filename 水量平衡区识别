@@ -1,0 +1,93 @@
+///水量平衡区识别
+library(terra)
+library(data.table)
+library(ggplot2)
+library(magrittr)
+
+# 1. 初始化与参数定义
+rm(list = ls())
+gc()
+
+# 水分平衡区间参数（核心）
+et_ranges <- data.table(
+  land_use = c(1, 2, 6, 7, 8, 9, 10, 11, 12),
+  type_name = c("农田", "乔木林地", "水域", "居民建设用地", 
+                "其他用地(8)", "其他用地(9)", "低覆盖度灌木荒漠",
+                "中覆盖度灌木荒漠", "高覆盖度灌木荒漠"),
+  et_min = c(1280, 1370, 1130, 1240, 1130, 1130, 1250, 1340, 1500),
+  et_max = c(1470, 1535, 1600, 1780, 1420, 1420, 1600, 1700, 2120)
+)
+
+# 2. 数据加载与预处理（核心步骤）
+message("加载数据...")
+land_use_map <- rast("E:/zou/data/LU/25.8LU/LU植被盖度.tif")
+et_map <- rast("E:/zou/data/lalance/pre-wgs.tif")
+
+# 研究区边界处理
+message("处理边界...")
+roi <- vect("E:/zou/data/LU/课题一研究区/沿黄岸线研究区.shp")
+crs(roi) <- "EPSG:4326"  # 强制统一坐标系
+
+# 坐标系统一与裁剪
+if (!same.crs(land_use_map, roi)) {
+  roi <- project(roi, crs(land_use_map))
+}
+land_use_clip <- crop(land_use_map, roi) %>% mask(roi)
+et_clip <- crop(et_map, roi) %>% mask(roi) %>% resample(land_use_clip)
+
+# 3. 分块计算函数（核心逻辑）
+process_core <- function(lu, et, ranges) {
+  result <- lu
+  terra::values(result) <- NA
+  stats_list <- list()
+  
+  for (i in seq(1, nrow(lu), by = 500)) {  # 分块大小固定为500
+    row_end <- min(i + 499, nrow(lu))
+    lu_chunk <- lu[i:row_end, , drop = FALSE]
+    et_chunk <- et[i:row_end, , drop = FALSE]
+    
+    # 提取值并计算状态
+    dt <- data.table(
+      land_use = terra::values(lu_chunk),
+      et = terra::values(et_chunk)
+    )[complete.cases(land_use, et)] %>% 
+      merge(ranges, by = "land_use") %>% 
+      .[, status := fcase(
+        et < et_min, 1L,
+        et > et_max, 2L,
+        default = 3L
+      )]
+    
+    # 更新结果
+    terra::values(result[i:row_end, ])[!is.na(dt$land_use)] <- dt$status
+    stats_list[[length(stats_list) + 1]] <- dt[, .(type_name, status)]
+    message(sprintf("进度: %.1f%%", i/nrow(lu)*100))
+  }
+  
+  list(raster = result, stats = rbindlist(stats_list))
+}
+
+# 4. 执行分析与输出（核心任务）
+message("开始计算...")
+result <- process_core(land_use_clip, et_clip, et_ranges)
+
+# 统计与可视化
+balance_stats <- result$stats[, .(
+  像元数 = .N,
+  占比 = .N/nrow(result$stats)
+), by = .(type_name, status = factor(status, 1:3, 
+                                     c("水分匮缺", "水分盈余", "水分平衡")))]
+
+ggplot(balance_stats, aes(x = type_name, y = 占比, fill = status)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A")) +
+  labs(title = "沿黄岸线水分平衡状况", x = "用地类型", y = "比例") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 保存结果
+writeRaster(result$raster, "水分平衡结果.tif", overwrite = TRUE)
+fwrite(balance_stats, "水分平衡统计.csv")
+message("分析完成！")
+
+
