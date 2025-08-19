@@ -1,0 +1,76 @@
+////各用地类型对应蒸发散区间
+library(terra)
+library(data.table)
+library(ggplot2)
+
+# 1. 设置terra处理选项（提高内存效率）
+terraOptions(memfrac = 0.8) # 使用80%可用内存
+terraOptions(tempdir = "E:/zou/temp") # 设置大容量临时目录
+
+# 2. 并行读取数据（使用terra的快速读取）
+land_use <- rast("E:/zou/data/LU/25.8LU/LU植被盖度.tif")
+et <- rast("E:/zou/data/PET/ET/NEW_ET30.tif")
+
+# 3. 快速空间匹配（使用最近邻重采样加速）
+if (crs(land_use) != crs(et)) {
+  et <- project(et, land_use, method = "near", threads = TRUE) # 启用多线程
+}
+
+# 分块处理大数据
+et_resampled <- resample(et, land_use, method = "near", 
+                         filename = tempfile(fileext = ".tif")) %>% 
+  crop(land_use) %>% 
+  mask(land_use)
+
+# 4. 使用data.table加速数据处理
+dt <- data.table(
+  land_use = as.integer(values(land_use, mat = FALSE)), # 直接获取向量
+  et = values(et_resampled, mat = FALSE)
+)[!is.na(land_use) & !is.na(et)] # 更快的NA处理方式
+
+# 5. 并行计算统计量
+et_stats <- dt[, {
+  n <- .N
+  m <- mean(et)
+  s <- sd(et)
+  list(
+    count = n,
+    mean = m,
+    sd = s,
+    q25 = quantile(et, 0.25),
+    median = median(et),
+    q75 = quantile(et, 0.75),
+    ci_lower = m - 1.96 * s/sqrt(n),
+    ci_upper = m + 1.96 * s/sqrt(n),
+    normal_lower = qnorm(0.025, m, s),
+    normal_upper = qnorm(0.975, m, s)
+  )
+}, by = land_use]
+
+# 6. 保存结果（使用fwrite加速）
+fwrite(et_stats, "E:/zou/data/ET30_by_land_use_stats.csv")
+
+# 7. 智能抽样可视化
+set.seed(123)
+if (nrow(dt) > 1e5) {
+  # 大数据：分层抽样保持各类比例
+  sample_dt <- dt[, .SD[sample(.N, min(1e5/.N, .N))], by = land_use]
+} else {
+  sample_dt <- dt
+}
+
+# 8. 高效绘图
+p <- ggplot(sample_dt, aes(x = factor(land_use), y = et)) +
+  geom_boxplot(aes(fill = factor(land_use)), alpha = 0.6, outlier.shape = NA) +
+  stat_summary(fun.data = mean_cl_normal, geom = "pointrange", 
+               color = "red", size = 0.7) +
+  labs(x = "用地类型", y = "蒸散发值", 
+       title = "不同用地类型的蒸散发分布") +
+  theme_minimal(base_size = 11) # 适当调整基础字体大小
+
+# 根据类别数量调整x轴标签
+if (length(unique(sample_dt$land_use)) > 10) {
+  p <- p + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+print(p)
