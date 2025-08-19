@@ -1,0 +1,130 @@
+# 完整修正版（解决对象作用域问题）
+library(terra)
+library(sf)
+library(dplyr)
+
+# 1. 改进的分块矢量化函数
+chunked_vectorize <- function(raster_layer, reference_layer, chunk_size = 2000) {
+  e <- ext(raster_layer)
+  x_seq <- seq(e$xmin, e$xmax, by = chunk_size)
+  y_seq <- seq(e$ymin, e$ymax, by = chunk_size)
+  if (max(x_seq) < e$xmax) x_seq <- c(x_seq, e$xmax)
+  if (max(y_seq) < e$ymax) y_seq <- c(y_seq, e$ymax)
+  
+  vector_list <- list()
+  
+  for (i in 1:(length(x_seq)-1)) {
+    for (j in 1:(length(y_seq)-1)) {
+      chunk_ext <- ext(x_seq[i], x_seq[i+1], y_seq[j], y_seq[j+1])
+      
+      # 使用safe_crop避免空块错误
+      safe_crop <- function(x, e) {
+        tryCatch(
+          crop(x, e),
+          error = function(e) NULL
+        )
+      }
+      
+      chunk <- safe_crop(raster_layer, chunk_ext)
+      lu_chunk <- safe_crop(reference_layer, chunk_ext)
+      
+      if (!is.null(chunk) && ncell(chunk) > 0) {
+        vec_chunk <- as.polygons(chunk, dissolve = FALSE)
+        if (nrow(values(vec_chunk)) > 0) {
+          values(vec_chunk) <- data.frame(
+            Original_LU = values(lu_chunk)[,1],
+            Reclassified = values(chunk)[,1]
+          )
+          vector_list[[paste(i,j)]] <- st_as_sf(vec_chunk)
+        }
+      }
+      gc()
+    }
+    cat(sprintf("进度: X方向 %.1f%%\n", i/length(x_seq)*100))
+  }
+  
+  # 使用更高效的方式合并
+  if (length(vector_list) > 0) {
+    do.call(rbind, vector_list)
+  } else {
+    stop("没有生成任何矢量块，请检查输入数据")
+  }
+}
+
+# 2. 完整处理流程函数
+process_data <- function() {
+  # 初始化
+  gc()
+  terraOptions(tempdir = "E:/zou/temp", memfrac = 0.6)
+  
+  # 1. 加载数据
+  cat("加载数据...\n")
+  land_use <- rast("E:/zou/data/LU/25.8LU/LU植被盖度.tif")
+  water_balance <- rast("E:/zou/用地类型和水分结合/water_balance_map.tif")
+  boundary <- st_read("E:/zou/data/LU/课题一研究区/沿黄岸线研究区.shp") |> st_zm()
+  
+  # 2. 统一CRS
+  target_crs <- crs(land_use)
+  if (is.na(st_crs(boundary))) {
+    st_crs(boundary) <- target_crs
+  } else if (!identical(st_crs(boundary)$wkt, crs(land_use, describe = TRUE)$wkt)) {
+    boundary <- st_transform(boundary, target_crs)
+  }
+  
+  # 3. 裁剪数据
+  cat("裁剪数据...\n")
+  boundary_vect <- vect(boundary)
+  land_use <- crop(land_use, boundary_vect) |> mask(boundary_vect)
+  water_balance <- crop(water_balance, boundary_vect) |> mask(boundary_vect)
+  
+  # 4. 重分类
+  cat("执行重分类...\n")
+  result <- land_use
+  fixed_classes <- c(0,1,2,6,7)
+  result[result %in% fixed_classes] <- 1
+  
+  to_modify <- which(!values(result) %in% fixed_classes)
+  wb_values <- values(water_balance)[to_modify]
+  values(result)[to_modify] <- ifelse(wb_values %in% c(1,3), 2, 1)
+  
+  # 5. 矢量转换
+  cat("开始矢量转换...\n")
+  sf_result <- chunked_vectorize(result, land_use) |> 
+    mutate(Class_Description = ifelse(Reclassified == 1, "一般区域", "限制区域"))
+  
+  # 6. 保存结果
+  cat("保存结果...\n")
+  if (!dir.exists("output")) dir.create("output")
+  writeRaster(result, "output/reclassified_result.tif", overwrite = TRUE)
+  st_write(sf_result, "output/reclassified_polygons.gpkg", delete_dsn = TRUE)
+  
+  # 返回结果
+  list(
+    raster = result,
+    vector = sf_result
+  )
+}
+
+# 3. 执行处理（带完整错误处理）
+result <- tryCatch({
+  process_data()
+}, error = function(e) {
+  cat("处理失败:", e$message, "\n")
+  # 紧急保存临时数据
+  if (exists("land_use")) writeRaster(land_use, "temp_landuse.tif", overwrite = TRUE)
+  if (exists("result")) writeRaster(result, "temp_result.tif", overwrite = TRUE)
+  stop("处理中断，已保存临时文件")
+}, finally = {
+  gc(reset = TRUE)
+  cat("内存已清理\n")
+})
+
+# 4. 结果验证
+if (!inherits(result, "try-error")) {
+  cat("\n处理成功！结果统计:\n")
+  print(table(result$vector$Reclassified))
+  
+  # 简单可视化
+  plot(result$raster, main = "重分类结果",
+       col = c("green", "red"),
+       plg = list(title = "分类", legend = c("一般区域", "限制区域")))
