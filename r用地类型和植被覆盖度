@@ -1,0 +1,77 @@
+library(terra)
+
+# 1. 读取数据
+land_use_path <- "E:/zou/data/LU/25.8LU/L8_LandUseClassification_Smoothed.tif"
+vegetation_path <- "E:/zou/风蚀量/植被覆盖因子/FVC_1000Exports/meanFVC.tif"
+
+land_use <- rast(land_use_path)
+vegetation <- rast(vegetation_path)
+
+# 2. 土地利用数据检查
+land_use_unique <- unique(land_use)[[1]]
+cat("土地利用唯一值：", land_use_unique, "\n")
+if (!3 %in% land_use_unique) stop("无类型3的土地利用数据！")
+
+# 3. 植被数据深度检查（重点：验证数据单位和分布）
+cat("\n===== 植被数据详细检查 =====")
+veg_vals <- values(vegetation)
+veg_clean <- veg_vals[!is.na(veg_vals)]  # 移除NA值
+
+# 检查数据是否为0-1范围（可能单位是比例而非百分比）
+if (max(veg_clean) <= 1) {
+  cat("\n植被数据范围为0-1，推测单位是比例（非百分比），将自动转换为百分比...\n")
+  vegetation <- vegetation * 100  # 转换为百分比（0-100）
+  veg_clean <- veg_clean * 100  # 同步更新检查数据
+}
+
+# 重新计算范围和分布
+cat("植被覆盖值（百分比）范围：", min(veg_clean), "~", max(veg_clean), "\n")
+cat("植被覆盖值中位数：", median(veg_clean), "\n")
+cat("植被覆盖值均值：", mean(veg_clean), "\n")
+
+# 按实际数据分布调整分类区间（关键改进）
+# 自动计算分位数，确保区间能覆盖实际数据
+quantiles <- quantile(veg_clean, probs = c(0.05, 0.15, 0.30), na.rm = TRUE)
+cat("\n植被数据分位数（25%、50%、75%）：", quantiles, "\n")
+
+# 若数据普遍偏低（如多数≤5%），使用分位数动态调整区间
+rcl_matrix <- matrix(
+  c(-Inf, quantiles[1], max(land_use_unique) + 1,  # 低覆盖 → 9
+    quantiles[1], quantiles[2], max(land_use_unique) + 2,  # 中低 → 10
+    quantiles[2], quantiles[3], max(land_use_unique) + 3,  # 中高 → 11
+    quantiles[3], Inf, max(land_use_unique) + 4),  # 高覆盖 → 12
+  ncol = 3, byrow = TRUE
+)
+cat("\n基于数据分布的动态分类规则：\n")
+cat("≤", quantiles[1], "% →", max(land_use_unique) + 1, "\n")
+cat(quantiles[1], "%-", quantiles[2], "% →", max(land_use_unique) + 2, "\n")
+cat(quantiles[2], "%-", quantiles[3], "% →", max(land_use_unique) + 3, "\n")
+cat(">", quantiles[3], "% →", max(land_use_unique) + 4, "\n")
+
+# 4. 重采样与匹配范围
+vegetation_resampled <- resample(vegetation, land_use, method = "bilinear")
+vegetation_resampled <- crop(vegetation_resampled, land_use)
+vegetation_resampled <- mask(vegetation_resampled, land_use)
+
+# 5. 掩膜验证
+mask_land_use3 <- land_use == 3
+type3_count <- sum(values(mask_land_use3), na.rm = TRUE)
+cat("\n类型3像素数量：", type3_count, "\n")
+
+# 6. 执行分类
+output <- classify(vegetation_resampled, rcl = rcl_matrix, right = TRUE)
+
+# 7. 验证分类结果
+output_unique <- unique(output)[[1]]
+cat("\n生成的新分类：", output_unique, "\n")
+missing_classes <- setdiff(max(land_use_unique) + 1:4, output_unique)
+if (length(missing_classes) > 0) {
+  warning("仍未生成分类：", missing_classes, "，数据可能过于集中")
+}
+
+# 8. 合并与保存
+final_output <- ifel(mask_land_use3, output, land_use)
+output_path <- "E:/zou/data/LU/25.8LU/LU植被.tif"
+writeRaster(final_output, output_path, filetype = "GTiff", overwrite = TRUE)
+cat("\n结果保存至：", output_path, "\n")
+cat("最终唯一值：", unique(final_output)[[1]], "\n")
