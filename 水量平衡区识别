@@ -126,7 +126,7 @@ calculate_water_balance <- function(shp_data) {
   # 计算水分平衡状态
   result_shp$water_status <- ifelse(
     result_shp$water_balance_diff < 100, 1L,  # 水分匮缺：差值 < 100
-    ifelse(result_shp$water_balance_diff > 140, 2L, 3L)  # 水分盈余：差值 > 130，平衡：100-130之间
+    ifelse(result_shp$water_balance_diff > 120, 2L, 3L)  # 水分盈余：差值 > 120，平衡：100-120之间
   )
   
   # 添加状态描述字段
@@ -179,7 +179,7 @@ if (nrow(valid_data) > 0) {
   # 可视化2：水分差值分布直方图
   p2 <- ggplot(result_dt, aes(x = water_balance_diff, fill = status_desc)) +
     geom_histogram(bins = 30, alpha = 0.7) +
-    geom_vline(xintercept = c(100, 130), linetype = "dashed", color = "red") +
+    geom_vline(xintercept = c(100, 120), linetype = "dashed", color = "red") +
     scale_fill_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A"),
                       name = "水分状态") +
     labs(title = "水分差值分布直方图 (PRE_WGS - ET/10)",
@@ -187,21 +187,10 @@ if (nrow(valid_data) > 0) {
     theme_minimal() +
     annotate("text", x = 50, y = max(table(cut(result_dt$water_balance_diff, 30))), 
              label = "匮缺区\n<100", color = "red", size = 4) +
-    annotate("text", x = 160, y = max(table(cut(result_dt$water_balance_diff, 30))), 
-             label = "盈余区\n>130", color = "red", size = 4)
+    annotate("text", x = 140, y = max(table(cut(result_dt$water_balance_diff, 30))), 
+             label = "盈余区\n>120", color = "red", size = 4)
   
   print(p2)
-  
-  # 可视化3：箱线图显示各状态的水分差值分布
-  p3 <- ggplot(result_dt, aes(x = status_desc, y = water_balance_diff, fill = status_desc)) +
-    geom_boxplot() +
-    scale_fill_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A")) +
-    labs(title = "各水分状态的水分差值分布",
-         x = "水分平衡状态", y = "PRE_WGS - ET/10") +
-    theme_minimal() +
-    theme(legend.position = "none")
-  
-  print(p3)
   
   # 保存带有结果字段的shp文件
   message("正在保存结果到shp文件...")
@@ -235,7 +224,7 @@ if (nrow(valid_data) > 0) {
     水分匮缺数量 = sum(water_status == 1),
     水分盈余数量 = sum(water_status == 2),
     水分平衡数量 = sum(water_status == 3),
-    水分匮缺比例 = paste0(round(sum(water_status == 1) / nrow(valid_data) * 100, 1), "%"),
+    水分匮缺比例 = paste0(round(sum(water_status == 1) / nrow(valid_data) * 100, 1, "%"),
     水分盈余比例 = paste0(round(sum(water_status == 2) / nrow(valid_data) * 100, 1), "%"),
     水分平衡比例 = paste0(round(sum(water_status == 3) / nrow(valid_data) * 100, 1), "%"),
     整体平均差值 = round(mean(water_balance_diff), 2)
@@ -246,11 +235,11 @@ if (nrow(valid_data) > 0) {
   
   fwrite(overall_stats, "整体水分平衡统计.csv")
   
-  # 输出判断阈值信息
+  # 输出判断阈值信息（统一改为120）
   cat("\n=== 判断阈值 ===\n")
   cat("水分匮缺区: PRE_WGS - ET/10 < 100\n")
-  cat("水分平衡区: 100 ≤ PRE_WGS - ET/10 ≤ 130\n")
-  cat("水分盈余区: PRE_WGS - ET/10 > 130\n")
+  cat("水分平衡区: 100 ≤ PRE_WGS - ET/10 ≤ 120\n")
+  cat("水分盈余区: PRE_WGS - ET/10 > 120\n")
   
   # 输出shp文件字段信息
   cat("\n=== 输出shp文件字段信息 ===\n")
