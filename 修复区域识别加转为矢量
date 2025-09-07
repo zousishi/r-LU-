@@ -128,3 +128,268 @@ if (!inherits(result, "try-error")) {
   plot(result$raster, main = "重分类结果",
        col = c("green", "red"),
        plg = list(title = "分类", legend = c("一般区域", "限制区域")))
+
+
+
+/////shp水量平衡修复区识别
+library(terra)
+library(sf)
+library(dplyr)
+
+# 1. 完整处理流程函数
+process_data <- function() {
+  # 初始化
+  gc()
+  
+  # 修正临时目录设置 - 确保目录存在
+  temp_dir <- "E:/zou/temp"
+  if (!dir.exists(temp_dir)) {
+    dir.create(temp_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  terraOptions(tempdir = temp_dir, memfrac = 0.6)
+  
+  # 1. 加载数据 - 增加文件存在性检查
+  cat("加载数据...\n")
+  
+  # 土地利用数据路径 - 先尝试默认路径，不存在则提示用户输入
+  land_use_path <- "E:/zou/data/LU/25.8LU/LU植被盖度.tif"
+  
+  # 检查文件是否存在
+  if (!file.exists(land_use_path)) {
+    cat(paste("错误: 土地利用数据文件不存在于", land_use_path, "\n"))
+    land_use_path <- readline(prompt = "请输入土地利用数据(tif)的正确路径: ")
+    
+    # 再次检查用户输入的路径
+    if (!file.exists(land_use_path)) {
+      stop(paste("仍然无法找到文件:", land_use_path))
+    }
+  }
+  
+  # 加载土地利用数据
+  land_use <- tryCatch({
+    rast(land_use_path)
+  }, error = function(e) {
+    stop(paste("无法加载土地利用数据:", e$message))
+  })
+  
+  # 水分平衡数据路径
+  water_shp_path <- "E:/zou/data/水量平衡/水量平衡计算/沿黄岸线水分平衡结果.shp"
+  
+  # 检查矢量文件是否存在
+  if (!file.exists(water_shp_path)) {
+    cat(paste("错误: 矢量数据文件不存在于", water_shp_path, "\n"))
+    water_shp_path <- readline(prompt = "请输入水分平衡数据(shp)的正确路径: ")
+    
+    if (!file.exists(water_shp_path)) {
+      stop(paste("仍然无法找到文件:", water_shp_path))
+    }
+  }
+  
+  # 加载矢量数据
+  water_shp <- tryCatch({
+    st_read(water_shp_path)
+  }, error = function(e) {
+    stop(paste("无法加载矢量数据:", e$message))
+  })
+  
+  # 检查水分数据字段
+  cat("水分数据字段:", names(water_shp), "\n")
+  if (!"wtr_stt" %in% names(water_shp)) {
+    stop("水分数据中未找到'wtr_stt'字段，请检查数据")
+  }
+  
+  # 2. 统一CRS
+  target_crs <- crs(land_use)
+  if (is.na(st_crs(water_shp))) {
+    st_crs(water_shp) <- target_crs
+    cat("为矢量数据分配了CRS\n")
+  } else if (!identical(st_crs(water_shp)$wkt, crs(land_use, describe = TRUE)$wkt)) {
+    water_shp <- st_transform(water_shp, target_crs)
+    cat("已将矢量数据转换为目标CRS\n")
+  }
+  
+  # 检查数据范围是否重叠
+  cat("检查数据范围是否重叠...\n")
+  land_ext <- ext(land_use)
+  water_ext <- st_bbox(water_shp)
+  
+  # 将sf边界框转换为terra的extent对象
+  water_ext_terra <- ext(water_ext[1], water_ext[3], water_ext[2], water_ext[4])
+  
+  # 使用relate函数检查是否重叠 (touches或overlaps)
+  rel <- relate(land_ext, water_ext_terra, "T*T******") | relate(land_ext, water_ext_terra, "T*****T**")
+  if (!rel) {
+    stop("土地利用数据和矢量数据的范围不重叠，请检查数据坐标或投影是否正确")
+  }
+  
+  # 3. 定义用地类型分类
+  land_use_classes <- c(
+    "1" = "耕地",
+    "2" = "林地", 
+    "3" = "草地",
+    "4" = "水域",
+    "5" = "建设用地",
+    "6" = "未利用地",
+    "7" = "其他"
+  )
+  
+  # 4. 将用地数据栅格值提取到shp文件的每个多边形
+  cat("提取用地类型数据到shp文件...\n")
+  
+  # 确保shp文件有唯一标识符
+  if (!"FID" %in% names(water_shp)) {
+    water_shp$FID <- 1:nrow(water_shp)
+  }
+  
+  # 添加用地类型相关字段
+  water_shp$land_use_value <- NA_integer_      # 用地类型数值
+  water_shp$land_use_class <- NA_character_    # 用地类型分类名称
+  water_shp$land_use_count <- NA_integer_      # 像元数量（用于统计主要类型）
+  
+  for (i in 1:nrow(water_shp)) {
+    polygon <- water_shp[i, ]
+    polygon_vect <- vect(polygon)
+    
+    # 检查多边形是否与栅格重叠
+    poly_ext <- ext(polygon_vect)
+    rel_poly <- relate(poly_ext, land_ext, "T*T******") | relate(poly_ext, land_ext, "T*****T**")
+    if (!rel_poly) {
+      cat(sprintf("警告: 多边形 %d 与土地利用数据范围不重叠，跳过处理\n", i))
+      next
+    }
+    
+    # 裁剪用地数据到当前多边形
+    lu_cropped <- crop(land_use, polygon_vect)
+    if (ncell(lu_cropped) > 0) {
+      lu_masked <- mask(lu_cropped, polygon_vect)
+      # 获取所有像元值
+      values <- values(lu_masked)
+      values <- values[!is.na(values)]
+      
+      if (length(values) > 0) {
+        # 统计各类像元数量
+        value_counts <- table(values)
+        # 取主要用地类型（众数）
+        main_value <- as.integer(names(sort(value_counts, decreasing = TRUE))[1])
+        main_count <- as.integer(value_counts[as.character(main_value)])
+        
+        water_shp$land_use_value[i] <- main_value
+        water_shp$land_use_count[i] <- main_count
+        water_shp$land_use_class[i] <- ifelse(
+          as.character(main_value) %in% names(land_use_classes),
+          land_use_classes[as.character(main_value)],
+          "未知类型"
+        )
+      }
+    } else {
+      cat(sprintf("警告: 多边形 %d 裁剪后无像元，跳过处理\n", i))
+    }
+    
+    if (i %% 100 == 0 || i == nrow(water_shp)) {
+      cat(sprintf("处理进度: %.1f%% (%d/%d)\n", i/nrow(water_shp)*100, i, nrow(water_shp)))
+    }
+  }
+  
+  # 5. 根据条件判断修复状态
+  cat("判断修复状态...\n")
+  water_shp <- water_shp %>%
+    mutate(
+      # 用地类型为2,3,4,5且水分情况为1,2
+      need_repair = ifelse(
+        land_use_value %in% c(2, 3, 4, 5) & wtr_stt %in% c(1, 2),
+        1,  # 待修复
+        2   # 不修复
+      ),
+      repair_status = ifelse(need_repair == 1, "待修复区域", "不修复区域"),
+      # 添加详细的判断条件字段
+      is_target_landuse = ifelse(land_use_value %in% c(2, 3, 4, 5), "是", "否"),
+      is_target_water = ifelse(wtr_stt %in% c(1, 2), "是", "否")
+    )
+  
+  # 6. 保存结果
+  cat("保存结果...\n")
+  if (!dir.exists("output")) dir.create("output")
+  
+  # 保存带有用地类型和修复状态的shp文件
+  st_write(water_shp, "output/water_balance_with_landuse_repair.shp", delete_dsn = TRUE)
+  
+  # 7. 创建可视化用的栅格结果（可选）
+  cat("创建可视化栅格...\n")
+  # 创建与用地数据相同范围的空栅格
+  result_raster <- rast(ext(land_use), resolution = res(land_use), crs = crs(land_use))
+  values(result_raster) <- 2  # 默认值为不修复
+  
+  # 将待修复区域栅格化
+  repair_areas <- water_shp %>% filter(need_repair == 1)
+  if (nrow(repair_areas) > 0) {
+    repair_raster <- rasterize(vect(repair_areas), result_raster, field = "need_repair")
+    result_raster <- ifel(!is.na(repair_raster), repair_raster, result_raster)
+  }
+  
+  writeRaster(result_raster, "output/repair_status_raster.tif", overwrite = TRUE)
+  
+  # 8. 保存用地类型分布栅格（可选）
+  landuse_raster <- rasterize(vect(water_shp), result_raster, field = "land_use_value")
+  writeRaster(landuse_raster, "output/landuse_distribution.tif", overwrite = TRUE)
+  
+  # 返回结果
+  list(
+    shp_with_data = water_shp,
+    raster_result = result_raster,
+    landuse_raster = landuse_raster
+  )
+}
+
+# 2. 执行处理（带完整错误处理）
+result <- tryCatch({
+  process_data()
+}, error = function(e) {
+  cat("处理失败:", e$message, "\n")
+  stop("处理中断")
+}, finally = {
+  gc(reset = TRUE)
+  cat("内存已清理\n")
+})
+
+# 3. 结果验证
+if (!inherits(result, "try-error")) {
+  cat("\n处理成功！结果统计:\n")
+  
+  # 统计修复状态
+  repair_stats <- table(result$shp_with_data$need_repair)
+  cat("修复状态统计:\n")
+  print(repair_stats)
+  
+  cat("\n用地类型分布:\n")
+  print(table(result$shp_with_data$land_use_class))
+  
+  cat("\n水分状态分布:\n")
+  print(table(result$shp_with_data$wtr_stt))
+  
+  cat("\n判断条件统计:\n")
+  cat("目标用地类型(2,3,4,5):", table(result$shp_with_data$is_target_landuse), "\n")
+  cat("目标水分状态(1,2):", table(result$shp_with_data$is_target_water), "\n")
+  
+  # 简单可视化
+  par(mfrow = c(1, 2))
+  plot(result$raster_result, main = "修复状态分布",
+       col = c("red", "green"),
+       plg = list(title = "修复状态", legend = c("待修复", "不修复")))
+  
+  plot(result$landuse_raster, main = "用地类型分布",
+       plg = list(title = "用地类型"))
+  
+  par(mfrow = c(1, 1))
+  
+  # 显示前几个多边形的完整属性
+  cat("\n前5个多边形的完整属性:\n")
+  print(head(result$shp_with_data %>% st_drop_geometry() %>% 
+               select(FID, land_use_value, land_use_class, land_use_count, 
+                      wtr_stt, is_target_landuse, is_target_water, 
+                      need_repair, repair_status), 5))
+  
+  cat("\n结果已保存到 output/water_balance_with_landuse_repair.shp\n")
+  cat("文件包含以下字段:\n")
+  print(names(result$shp_with_data))
+}
+
