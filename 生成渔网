@@ -1,0 +1,480 @@
+#生成分块网格
+library(sf)
+library(dplyr)
+
+# 分块生成网格的核心函数（适配所有sf版本）
+create_tiled_grid <- function(
+    input_poly,        # 输入的sf面数据
+    grid_size,         # 网格单元大小（米，统一参数名，内部自动适配）
+    tile_size,         # 子块大小（米）
+    output_dir,        # 输出目录
+    output_format = "gpkg"
+) {
+  # 1. 输入合法性检查
+  if (!inherits(input_poly, "sf")) stop("输入必须是sf对象")
+  if (st_crs(input_poly)$IsGeographic) {
+    stop("请先将数据转换为投影坐标系（如Albers或UTM），确保单位为米")
+  }
+  # 移除无关属性字段，减少内存占用
+  input_poly <- input_poly %>% select(geometry)
+  
+  # 2. 自动检测st_make_grid的正确参数名（关键修复）
+  # 检查当前sf版本中st_make_grid的参数名
+  grid_args <- formals(st_make_grid)
+  if ("cell_resolution" %in% names(grid_args)) {
+    size_param <- "cell_resolution"  # 较新sf版本
+  } else if ("cellsize" %in% names(grid_args)) {
+    size_param <- "cellsize"         # 早期sf版本（最可能适配你的情况）
+  } else if ("cell_size" %in% names(grid_args)) {
+    size_param <- "cell_size"        # 部分过渡版本
+  } else {
+    stop("无法识别当前sf版本的网格大小参数，请更新sf包至最新版本")
+  }
+  message("检测到sf版本参数：", size_param, "，将用于网格生成")
+  
+  # 3. 创建输出目录
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # 4. 计算整体边界与分块数量
+  bbox <- st_bbox(input_poly)
+  x_min <- bbox[["xmin"]]; x_max <- bbox[["xmax"]]
+  y_min <- bbox[["ymin"]]; y_max <- bbox[["ymax"]]
+  
+  x_tiles <- ceiling((x_max - x_min) / tile_size)
+  y_tiles <- ceiling((y_max - y_min) / tile_size)
+  message("总分块数：", x_tiles * y_tiles, "（", x_tiles, "列 × ", y_tiles, "行）")
+  
+  # 5. 循环处理每个子块
+  for (i in 1:x_tiles) {
+    for (j in 1:y_tiles) {
+      # 5.1 计算当前子块边界
+      tile_xmin <- x_min + (i - 1) * tile_size
+      tile_xmax <- min(tile_xmin + tile_size, x_max)
+      tile_ymin <- y_min + (j - 1) * tile_size
+      tile_ymax <- min(tile_ymin + tile_size, y_max)
+      
+      # 5.2 创建子块边界的面要素
+      tile_bbox <- st_bbox(c(
+        xmin = tile_xmin, xmax = tile_xmax,
+        ymin = tile_ymin, ymax = tile_ymax
+      ), crs = st_crs(input_poly))
+      tile_poly <- st_as_sfc(tile_bbox)
+      
+      # 5.3 跳过无重叠的子块
+      overlap <- st_intersects(tile_poly, input_poly, sparse = FALSE)[1, 1]
+      if (!overlap) {
+        if (j %% 10 == 0) message("子块 (", i, ",", j, ") 无重叠区域，跳过")
+        next
+      }
+      
+      # 5.4 裁剪输入面至当前子块
+      input_tile <- st_intersection(input_poly, tile_poly)
+      if (nrow(input_tile) == 0) next
+      
+      # 5.5 生成子块内的网格（使用自动检测的参数名）
+      message("正在处理子块 (", i, ",", j, ")，范围：", 
+              round(tile_xmin), "~", round(tile_xmax), "m（x）；",
+              round(tile_ymin), "~", round(tile_ymax), "m（y）")
+      
+      # 动态构建参数列表，适配不同版本的参数名
+      grid_params <- list(
+        x = input_tile,
+        what = "polygons",
+        crs = st_crs(input_poly)
+      )
+      grid_params[[size_param]] <- grid_size  # 关键：使用检测到的参数名
+      
+      # 生成网格
+      tile_grid <- do.call(st_make_grid, grid_params) %>% 
+        st_sf(geometry = .) %>%
+        st_intersection(input_tile) %>%
+        filter(!st_is_empty(geometry)) %>%
+        mutate(
+          tile_id = paste0("tile_", i, "_", j),
+          grid_id = paste0(tile_id, "_", row_number())
+        )
+      
+      # 5.6 保存子块网格
+      output_path <- file.path(output_dir, paste0("grid_tiled.", output_format))
+      if (file.exists(output_path)) {
+        st_write(tile_grid, output_path, layer = "grid", append = TRUE, quiet = TRUE)
+      } else {
+        st_write(tile_grid, output_path, layer = "grid", append = FALSE, quiet = TRUE)
+      }
+      
+      # 5.7 清理内存
+      rm(input_tile, tile_grid, grid_params)
+      gc(verbose = FALSE)
+    }
+  }
+  
+  message("所有子块处理完成，完整网格保存至：", output_path)
+  return(output_path)
+}
+
+# ----------------------
+# 使用示例
+# ----------------------
+
+# 1. 读取数据（已为Albers投影）
+sanbei_poly <- st_read("D:/小论文/数据/用地类型图/三北防护林建设工程边界数据集/三北防护林建设工程.shp")
+
+# 2. 设置参数
+grid_size <- 896.1768058  # 网格单元大小（米）
+tile_size <- 50000        # 子块大小（50km）
+output_dir <- "D:/小论文/数据/用地类型图/三北防护林网格_分块结果"
+
+# 3. 分块生成网格（自动适配sf版本）
+final_grid_path <- create_tiled_grid(
+  input_poly = sanbei_poly,
+  grid_size = grid_size,
+  tile_size = tile_size,
+  output_dir = output_dir,
+  output_format = "gpkg"
+)
+
+# 4. 预览结果
+if (file.exists(final_grid_path)) {
+  sample_grid <- st_read(final_grid_path, layer = "grid", rows = 1:100)
+  plot(st_geometry(sample_grid), main = "网格预览", border = "red", lwd = 0.5)
+}
+
+
+library(sf)
+library(dplyr)
+
+gpkg_to_shp <- function(
+    gpkg_path,
+    output_dir,
+    max_features = 10000
+) {
+  if (!file.exists(gpkg_path)) {
+    stop("未找到GeoPackage文件：", gpkg_path)
+  }
+  
+  output_dir <- file.path(output_dir, "shapefiles_from_gpkg")
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # 读取图层信息并确认几何列
+  layers <- st_layers(gpkg_path)
+  message("发现GeoPackage图层：", layers$name)
+  layer_name <- layers$name[1]
+  
+  # 关键修复1：先读取少量数据确认几何列名称
+  sample_data <- st_read(gpkg_path, layer = layer_name, rows = 1:1, quiet = TRUE)
+  geom_col <- st_geometry(sample_data) %>% attr("sf_column")  # 获取实际几何列名
+  if (is.null(geom_col)) {
+    stop("GeoPackage文件中未找到有效的几何列，请检查原文件是否损坏")
+  }
+  message("检测到几何列名称：", geom_col)
+  rm(sample_data)
+  
+  # 读取总记录数（优化：避免全量读取）
+  total_count <- layers$features[layers$name == layer_name]  # 直接从图层信息获取总数量
+  message("总网格单元数量：", total_count)
+  batches <- ceiling(total_count / max_features)
+  message("将分为", batches, "个Shapefile，每个最多包含", max_features, "个单元")
+  
+  for (b in 1:batches) {
+    start_row <- (b - 1) * max_features + 1
+    end_row <- min(b * max_features, total_count)
+    message("正在转换第", b, "/", batches, "批（", start_row, "~", end_row, "行）")
+    
+    # 关键修复2：读取时明确指定几何列
+    batch_data <- st_read(
+      gpkg_path,
+      layer = layer_name,
+      rows = start_row:end_row,
+      quiet = TRUE
+    ) %>% 
+      st_set_geometry(geom_col)  # 强制设置几何列
+    
+    # 关键修复3：检查几何列是否存在
+    if (is.null(st_geometry(batch_data))) {
+      warning("第", b, "批数据丢失几何列，跳过")
+      next
+    }
+    
+    # 处理属性字段（确保字段名兼容）
+    batch_data <- batch_data %>%
+      rename(
+        tile_id = tile_id,
+        grid_id = grid_id
+      ) %>%
+      select(tile_id, grid_id, all_of(geom_col))  # 保留几何列
+    
+    # 保存为Shapefile
+    shp_filename <- paste0("grid_batch_", b, ".shp")
+    shp_path <- file.path(output_dir, shp_filename)
+    st_write(batch_data, shp_path, append = FALSE, quiet = TRUE)
+    
+    rm(batch_data)
+    gc(verbose = FALSE)
+  }
+  
+  message("转换完成，Shapefile保存至：", output_dir)
+  return(output_dir)
+}
+
+# 使用示例（路径不变）
+gpkg_file <- "D:/小论文/数据/用地类型图/三北防护林网格_分块结果/grid_tiled.gpkg"
+output_directory <- "D:/小论文/数据/用地类型图/三北防护林网格_分块结果"
+
+shp_dir <- gpkg_to_shp(
+  gpkg_path = gpkg_file,
+  output_dir = output_directory,
+  max_features = 10000
+)
+
+
+#转为shp格式------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+library(sf)
+library(dplyr)
+library(RSQLite)
+library(DBI)
+
+gpkg_to_shp_final <- function(
+    gpkg_path,
+    layer_name = "grid",
+    output_dir = "D:/shp_temp",
+    max_features = 150000
+) {
+  # 1. 基础设置
+  if (!file.exists(gpkg_path)) stop("GPKG文件不存在：", gpkg_path)
+  output_dir <- file.path(output_dir, "shp_output")
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  message("输出目录：", output_dir)
+  
+  # 2. 连接数据库并验证图层
+  conn <- dbConnect(RSQLite::SQLite(), gpkg_path)
+  on.exit(dbDisconnect(conn))
+  
+  all_tables <- dbListTables(conn)
+  if (!layer_name %in% all_tables) {
+    stop("图层 '", layer_name, "' 不存在！存在的图层：", paste(all_tables, collapse = ", "))
+  }
+  message("已定位图层：", layer_name)
+  
+  # 3. 确定几何列和坐标系
+  layer_cols <- dbListFields(conn, layer_name)
+  message("图层列名：", paste(layer_cols, collapse = ", "))
+  
+  common_geom_cols <- c("geom", "geometry", "shape")
+  geom_col <- intersect(common_geom_cols, layer_cols)[1]
+  if (is.na(geom_col)) stop("未找到几何列")
+  message("使用几何列：", geom_col)
+  
+  # 修复坐标系（使用ESRI:54009替代无效的EPSG:54009）
+  crs_obj <- st_crs("ESRI:54009")
+  message("使用坐标系：", crs_obj$input)
+  
+  # 4. 获取总记录数
+  total_count <- dbGetQuery(conn, paste0("SELECT COUNT(*) AS cnt FROM ", layer_name))$cnt[1]
+  batches <- ceiling(total_count / max_features)
+  message("总记录数：", total_count, " → 分", batches, "批")
+  
+  # 5. 分批处理（处理二进制几何数据）
+  saved_files <- c()
+  for (b in 1:batches) {
+    start <- (b - 1) * max_features
+    end <- max_features
+    message("\n处理第", b, "/", batches, "批（跳过", start, "行）")
+    
+    # 5.1 读取二进制几何数据（不直接过滤，避免类型错误）
+    query <- paste0(
+      "SELECT ", geom_col, " AS geom_blob, rowid 
+       FROM ", layer_name, " 
+       LIMIT ", end, " OFFSET ", start
+    )
+    raw_data <- tryCatch({
+      dbGetQuery(conn, query)
+    }, error = function(e) {
+      message("❌ 读取失败：", substr(e$message, 1, 80))
+      return(NULL)
+    })
+    
+    if (is.null(raw_data) || nrow(raw_data) == 0) break
+    
+    # 5.2 处理二进制几何数据（关键修复）
+    # 转换二进制BLOB为sfc对象（直接过滤NA值）
+    geom_sfc <- tryCatch({
+      # 直接从二进制转换，跳过文本过滤步骤
+      st_as_sfc(raw_data$geom_blob, crs = crs_obj)
+    }, error = function(e) {
+      message("❌ 转换几何数据失败：", substr(e$message, 1, 80))
+      return(NULL)
+    })
+    
+    if (is.null(geom_sfc) || length(geom_sfc) == 0) next
+    
+    # 5.3 构建sf对象并过滤空几何
+    batch_sf <- st_sf(
+      grid_id = paste0("g_", b, "_", 1:length(geom_sfc)),
+      geometry = geom_sfc,
+      crs = crs_obj
+    ) %>% filter(!st_is_empty(geometry))
+    
+    if (nrow(batch_sf) == 0) {
+      message("❌ 该批次无有效几何")
+      next
+    }
+    
+    # 5.4 保存为Shapefile
+    shp_name <- paste0("grid_batch_", b, ".shp")
+    shp_path <- file.path(output_dir, shp_name)
+    write_ok <- tryCatch({
+      st_write(
+        batch_sf,
+        shp_path,
+        driver = "ESRI Shapefile",
+        append = FALSE,
+        quiet = TRUE,
+        layer_options = c("ENCODING=CP1252", "SHPT=POLYGON")
+      )
+      TRUE
+    }, error = function(e) FALSE)
+    
+    if (write_ok && file.exists(shp_path)) {
+      saved_files <- c(saved_files, shp_name)
+      message("✅ 保存成功：", shp_name, "（", nrow(batch_sf), "个单元）")
+    } else {
+      message("❌ 保存失败：", shp_name)
+    }
+    
+    rm(raw_data, geom_sfc, batch_sf)
+    gc(verbose = FALSE)
+  }
+  
+  # 6. 结果汇总
+  message("\n=== 转换结束 ===")
+  message("成功生成文件数：", length(saved_files))
+  if (length(saved_files) > 0) {
+    message("示例文件：", file.path(output_dir, saved_files[1]))
+  } else {
+    stop("❌ 未生成任何文件")
+  }
+  
+  return(output_dir)
+}
+
+# 运行代码
+shp_result <- gpkg_to_shp_final(
+  gpkg_path = "D:/小论文/数据/用地类型图/三北防护林网格_分块结果/grid_tiled.gpkg",
+  layer_name = "grid",
+  output_dir = "D:/shp_temp",
+  max_features = 150000  # 建议使用较小批次，避免内存问题
+)
+
+
+#shp合并---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+library(sf)
+library(dplyr)
+
+# 合并多个Shapefile矢量面的函数
+merge_shapefiles <- function(
+    input_dir,        # 存放多个Shapefile的文件夹路径
+    output_path,      # 合并后输出的文件路径（如"./merged_grid.shp"）
+    batch_size = 30   # 每批读取的文件数（根据内存调整）
+) {
+  # 1. 检查输入目录
+  if (!dir.exists(input_dir)) {
+    stop("输入目录不存在：", input_dir)
+  }
+  
+  # 2. 获取所有Shapefile的路径（.shp文件）
+  shp_files <- list.files(
+    path = input_dir,
+    pattern = "\\.shp$",
+    full.names = TRUE,
+    recursive = FALSE  # 不搜索子文件夹
+  )
+  
+  if (length(shp_files) == 0) {
+    stop("输入目录中未找到任何Shapefile（.shp）")
+  }
+  
+  message("找到", length(shp_files), "个Shapefile，准备合并...")
+  
+  # 3. 分批读取并合并（避免内存溢出）
+  total_batches <- ceiling(length(shp_files) / batch_size)
+  merged_data <- NULL  # 存储最终合并结果
+  
+  for (batch in 1:total_batches) {
+    # 计算当前批次的文件索引
+    start_idx <- (batch - 1) * batch_size + 1
+    end_idx <- min(batch * batch_size, length(shp_files))
+    current_files <- shp_files[start_idx:end_idx]
+    
+    message("处理第", batch, "/", total_batches, "批（", length(current_files), "个文件）")
+    
+    # 3.1 读取当前批次的所有Shapefile
+    batch_data <- lapply(current_files, function(file) {
+      tryCatch({
+        st_read(file, quiet = TRUE) %>% 
+          select(geometry)  # 只保留几何列，减少内存占用
+      }, error = function(e) {
+        message("⚠️  读取文件失败：", basename(file), "（错误：", e$message, "）")
+        return(NULL)
+      })
+    })
+    
+    # 过滤空数据
+    batch_data <- Filter(Negate(is.null), batch_data)
+    if (length(batch_data) == 0) {
+      message("⚠️  第", batch, "批无有效数据，跳过")
+      next
+    }
+    
+    # 3.2 合并当前批次的数据
+    batch_merged <- do.call(rbind, batch_data)
+    
+    # 3.3 与总结果合并
+    if (is.null(merged_data)) {
+      merged_data <- batch_merged
+    } else {
+      merged_data <- rbind(merged_data, batch_merged)
+    }
+    
+    # 清理内存
+    rm(batch_data, batch_merged)
+    gc(verbose = FALSE)
+  }
+  
+  # 4. 最终处理与保存
+  if (is.null(merged_data)) {
+    stop("❌  所有文件均无法合并，可能数据损坏")
+  }
+  
+  # 可选：添加唯一ID（如需保留属性）
+  merged_data <- merged_data %>%
+    mutate(grid_id = row_number()) %>%
+    select(grid_id, geometry)
+  
+  # 保存合并结果
+  dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+  st_write(merged_data, output_path, append = FALSE, quiet = TRUE)
+  message("✅  合并完成，保存至：", output_path)
+  message("合并后总要素数：", nrow(merged_data))
+  
+  return(merged_data)
+}
+
+# ----------------------
+# 使用示例
+# ----------------------
+
+# 设置路径（替换为你的实际路径）
+input_directory <- "D:/shp_temp/shp_output"  # 存放分批生成的Shapefile的文件夹
+output_file <- "D:/shp_temp/merged_total.shp"  # 合并后的输出文件
+
+# 执行合并（根据电脑内存调整batch_size：8GB内存用5-8，16GB内存用10-20）
+merged_result <- merge_shapefiles(
+  input_dir = input_directory,
+  output_path = output_file,
+  batch_size = 10  # 每批处理10个文件
+)
+
+# 可选：查看合并结果的前10条
+if (!is.null(merged_result)) {
+  print(head(merged_result, 10))
+}
