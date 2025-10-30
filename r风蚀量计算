@@ -1,0 +1,186 @@
+library(terra)
+library(ggplot2)
+library(RColorBrewer)
+library(dplyr)
+
+setwd("E:/zou/30m/投影")
+
+# 1. 数据加载和预处理（不变） ------------------------------------------------------
+cat("正在加载和预处理输入数据...\n")
+
+preprocess_rasters <- function(input_files) {
+  rasters <- lapply(input_files, function(f) {
+    fpath <- file.path(getwd(), f)
+    if(!file.exists(fpath)) stop("文件不存在: ", fpath)
+    rast(fpath)
+  })
+  
+  target_crs <- crs(rasters[[1]])
+  rasters <- lapply(rasters, function(r) {
+    if(!identical(crs(r), target_crs)) {
+      cat("正在重投影", names(input_files)[which(sapply(rasters, identical, r))], "...\n")
+      project(r, target_crs, method = "bilinear")
+    } else {
+      r
+    }
+  })
+  
+  ref_extent <- ext(rasters[[1]])
+  rasters <- lapply(rasters, function(r) {
+    crop(r, ref_extent, snap = "near")
+  })
+  
+  ref_raster <- rasters[[1]]
+  rasters <- lapply(rasters, function(r) {
+    if(!identical(dim(r), dim(ref_raster))) {
+      resample(r, ref_raster, method = "bilinear")
+    } else {
+      r
+    }
+  })
+  
+  return(rasters)
+}
+
+input_files <- c(
+  wf = "WF_Project1.tif",
+  ef = "EF-Project.tif", 
+  scf = "SCF_Project.tif",
+  k = "cucaoProj1.tif",
+  c = "C.tif"
+)
+
+tryCatch({
+  rasters_cropped <- preprocess_rasters(input_files)
+}, error = function(e) {
+  stop("数据预处理失败: ", e$message)
+})
+
+# 2. 拆分计算函数为单输出（关键修正） -------------------------------------------------
+# 计算潜在风蚀量
+calculate_potential <- function(WF, EF, SCF, K, C) {
+  result <- WF * NA_real_
+  valid <- complete.cases(cbind(WF, EF, SCF, K, C))
+  if (any(valid)) {
+    wf_val <- WF[valid]
+    ef_val <- EF[valid]
+    scf_val <- SCF[valid]
+    k_val <- K[valid]
+    common_part <- wf_val * ef_val * scf_val * k_val
+    Q_MAX_potential <- 109.8 * common_part
+    S_potential <- 150.71 * common_part^(-0.3711)
+    z_val <- 50
+    result[valid] <- (2 * z_val / (S_potential^2)) * Q_MAX_potential * exp(-(z_val / S_potential)^2)
+  }
+  return(result)
+}
+
+# 计算实际风蚀量
+calculate_actual <- function(WF, EF, SCF, K, C) {
+  result <- WF * NA_real_
+  valid <- complete.cases(cbind(WF, EF, SCF, K, C))
+  if (any(valid)) {
+    wf_val <- WF[valid]
+    ef_val <- EF[valid]
+    scf_val <- SCF[valid]
+    k_val <- K[valid]
+    c_val <- C[valid]
+    common_part <- wf_val * ef_val * scf_val * k_val
+    Q_MAX <- 109.8 * common_part * c_val  # Q_MAX_potential * c_val
+    S <- 150.71 * (common_part * c_val)^(-0.3711)
+    z_val <- 50
+    result[valid] <- (2 * z_val / (S^2)) * Q_MAX * exp(-(z_val / S)^2)
+  }
+  return(result)
+}
+
+# 计算风蚀量差值（SR）
+calculate_SR <- function(potential, actual) {
+  return(potential - actual)
+}
+
+# 3. 分步执行计算（避免lapp多输出冲突） ---------------------------------------------------------------
+cat("开始计算风蚀量相关指标(z=50)...\n")
+
+terraOptions(memfrac = 0.5, progress = 3)
+
+tryCatch({
+  input_stack <- rast(rasters_cropped)
+  names(input_stack) <- names(input_files)
+  
+  # 第一步：计算潜在风蚀量（单输出，匹配像元数量）
+  cat("计算潜在风蚀量...\n")
+  S_Lpotential <- lapp(input_stack, fun = calculate_potential)
+  names(S_Lpotential) <- "Potential_Wind_Erosion"
+  
+  # 第二步：计算实际风蚀量（单输出）
+  cat("计算实际风蚀量...\n")
+  S_L <- lapp(input_stack, fun = calculate_actual)
+  names(S_L) <- "Actual_Wind_Erosion"
+  
+  # 第三步：计算差值（基于前两个结果）
+  cat("计算风蚀量差值...\n")
+  SR <- calculate_SR(S_Lpotential, S_L)
+  names(SR) <- "SR_Value_z50"
+  
+}, error = function(e) {
+  stop("风蚀量计算失败: ", e$message)
+})
+
+# 4. 保存结果（TIFF格式） ------------------------------------------------------
+if (!dir.exists("results")) dir.create("results")
+
+cat("保存计算结果（TIFF格式）...\n")
+tryCatch({
+  writeRaster(S_Lpotential, "results/Potential_Wind_Erosion.tif", overwrite = TRUE, filetype = "GTiff")
+  writeRaster(S_L, "results/Actual_Wind_Erosion.tif", overwrite = TRUE, filetype = "GTiff")
+  writeRaster(SR, "results/SR_Result.tif", overwrite = TRUE, filetype = "GTiff")
+}, error = function(e) {
+  stop("结果保存失败: ", e$message)
+})
+
+# 5. 生成统计报告 ----------------------------------------------------------
+cat("生成统计摘要和报告...\n")
+
+stats_potential <- data.frame(
+  Index = "潜在风蚀量",
+  Min = min(values(S_Lpotential), na.rm = TRUE),
+  Mean = mean(values(S_Lpotential), na.rm = TRUE),
+  Max = max(values(S_Lpotential), na.rm = TRUE),
+  SD = sd(values(S_Lpotential), na.rm = TRUE),
+  NA_Count = sum(is.na(values(S_Lpotential)))
+)
+
+stats_actual <- data.frame(
+  Index = "实际风蚀量",
+  Min = min(values(S_L), na.rm = TRUE),
+  Mean = mean(values(S_L), na.rm = TRUE),
+  Max = max(values(S_L), na.rm = TRUE),
+  SD = sd(values(S_L), na.rm = TRUE),
+  NA_Count = sum(is.na(values(S_L)))
+)
+
+stats_sr <- data.frame(
+  Index = "风蚀量差值(SR)",
+  Min = min(values(SR), na.rm = TRUE),
+  Mean = mean(values(SR), na.rm = TRUE),
+  Max = max(values(SR), na.rm = TRUE),
+  SD = sd(values(SR), na.rm = TRUE),
+  NA_Count = sum(is.na(values(SR)))
+)
+
+all_stats <- rbind(stats_potential, stats_actual, stats_sr)
+write.csv(all_stats, "results/Wind_Erosion_Statistics.csv", row.names = FALSE)
+
+sink("results/calculation_log.txt")
+cat("风蚀量计算报告\n")
+cat("生成时间:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+cat("输入文件:\n")
+print(input_files)
+cat("\n预处理摘要:\n")
+print(sapply(rasters_cropped, function(r) paste0("尺寸: ", paste(dim(r), collapse="x"))))
+cat("\n统计结果:\n")
+print(all_stats)
+sink()
+
+cat("\n计算完成！结果已保存到results目录。\n")
