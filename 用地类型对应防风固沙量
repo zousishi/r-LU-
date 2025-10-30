@@ -1,0 +1,133 @@
+# 完整代码：防风固沙服务功能栅格处理与赋值
+library(dplyr)        # 数据处理
+library(terra)        # 栅格处理
+library(sf)           # 矢量处理
+
+# --------------------------
+# 1. 路径设置
+# --------------------------
+rm(list = ls())
+# 输入数据路径
+vector_adjusted_path <- "E:/zou/30m/水量平衡/adjusted_land_vector.shp"  # 已调整的矢量数据（含lu、LU2）
+wind_sand_tif <- "E:/zou/30m/投影/results/SR_Result.tif"           # 防风固沙栅格
+# 输出数据路径
+output_vector_sr <- "E:/zou/30m/水量平衡/adjusted_land_vector_with_sr.shp"  # 含sr字段的矢量
+output_sr_stats <- "E:/zou/30m/水量平衡/wind_sand_stats.csv"                  # 统计结果
+
+# --------------------------
+# 2. 加载基础数据
+# --------------------------
+message("加载基础数据...")
+
+# 加载已调整的矢量数据（含lu、LU2字段）
+if (!file.exists(vector_adjusted_path)) {
+  stop("调整后的矢量文件不存在：", vector_adjusted_path)
+}
+vector_adjusted <- st_read(vector_adjusted_path, quiet = TRUE)
+# 检查必要字段
+required_fields <- c("lu", "LU2")
+missing_fields <- setdiff(required_fields, names(vector_adjusted))
+if (length(missing_fields) > 0) {
+  stop("矢量缺少必要字段：", paste(missing_fields, collapse = ", "))
+}
+
+# 加载防风固沙栅格
+if (!file.exists(wind_sand_tif)) {
+  stop("防风固沙栅格不存在：", wind_sand_tif)
+}
+wind_rast <- rast(wind_sand_tif)
+message("原始防风固沙栅格坐标系：", as.character(crs(wind_rast)))
+
+# --------------------------
+# 3. 栅格投影至矢量坐标系
+# --------------------------
+message("统一坐标系...")
+vector_crs_wkt <- st_as_text(st_crs(vector_adjusted))  # 矢量坐标系（WKT）
+message("矢量坐标系：", substr(vector_crs_wkt, 1, 100))
+
+# 投影防风固沙栅格
+if (as.character(crs(wind_rast)) != vector_crs_wkt) {
+  message("将防风固沙栅格投影至矢量坐标系...")
+  wind_rast_proj <- project(wind_rast, vector_crs_wkt)  # 重投影
+} else {
+  wind_rast_proj <- wind_rast  # 坐标系一致，无需投影
+}
+message("投影后防风固沙栅格坐标系：", as.character(crs(wind_rast_proj)))
+
+# --------------------------
+# 4. 提取栅格值到矢量单元
+# --------------------------
+message("提取防风固沙值到矢量...")
+
+# 自定义函数：计算矢量单元内的平均栅格值
+calc_mean <- function(x, na.rm = TRUE) {
+  mean(x, na.rm = na.rm)
+}
+
+# 提取每个矢量单元的平均防风固沙值
+extracted_wind <- extract(
+  x = wind_rast_proj,
+  y = vect(vector_adjusted),  # 基于调整后的矢量边界提取
+  fun = calc_mean,
+  na.rm = TRUE
+)
+
+# 将提取的值添加到矢量（新增wind_sand字段）
+vector_with_wind <- vector_adjusted %>%
+  mutate(wind_sand = extracted_wind[, 2]) %>%  # 第1列为ID，第2列为提取值
+  filter(!is.na(wind_sand))  # 过滤提取失败的单元（可选）
+
+# --------------------------
+# 5. 计算平均服务功能并关联到LU2
+# --------------------------
+message("计算并关联防风固沙服务功能...")
+
+# 按原始用地类型（lu）计算平均防风固沙值
+landtype_sr_mean <- vector_with_wind %>%
+  st_drop_geometry() %>%
+  group_by(lu) %>%
+  summarise(mean_sr = mean(wind_sand, na.rm = TRUE)) %>%  # 原始类型的平均服务功能
+  rename(LU2 = lu)  # 与调整后类型LU2匹配
+
+# 基于LU2字段赋值到sr字段
+vector_with_sr <- vector_with_wind %>%
+  left_join(landtype_sr_mean, by = "LU2") %>%  # 关联调整后类型的平均服务功能
+  rename(sr = mean_sr) %>%  # 重命名为sr字段（防风固沙服务功能）
+  # 处理缺失值：用该单元自身的原始提取值填充
+  mutate(sr = ifelse(is.na(sr), wind_sand, sr)) %>%
+  select(-wind_sand)  # 移除临时字段
+
+# --------------------------
+# 6. 统计与输出结果
+# --------------------------
+message("生成统计结果...")
+
+# 统计各调整后类型（LU2）的服务功能
+sr_stats <- vector_with_sr %>%
+  st_drop_geometry() %>%
+  group_by(LU2) %>%
+  summarise(
+    样本数量 = n(),
+    平均防风固沙服务 = mean(sr, na.rm = TRUE),
+    服务标准差 = sd(sr, na.rm = TRUE)
+  )
+
+# 保存结果
+# 创建输出目录（若不存在）
+output_dir <- dirname(output_vector_sr)
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# 保存矢量数据（含sr字段）
+st_write(vector_with_sr, output_vector_sr, delete_dsn = TRUE, quiet = FALSE)
+# 保存统计结果
+write.csv(sr_stats, output_sr_stats, row.names = FALSE, fileEncoding = "UTF-8")
+
+# --------------------------
+# 7. 完成提示
+# --------------------------
+message("所有操作完成！")
+message("包含防风固沙服务功能的矢量路径：", output_vector_sr)
+message("统计结果路径：", output_sr_stats)
+message("矢量包含字段：", paste(names(vector_with_sr), collapse = ", "))
