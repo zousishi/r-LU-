@@ -91,178 +91,106 @@ fwrite(balance_stats, "水分平衡统计.csv")
 message("分析完成！")
 
 ////shp是写水量平衡
-#水量平衡区识别
+# 水量平衡分析（确保SHP文件包含完整关系字段）
+# 分类标准：
+# - 1：匮缺区：(pre30 - weighted_gw) < et30
+# - 2：平衡区：其他情况
+# - 3：盈余区：pre30 > et30
 library(terra)
 library(data.table)
-library(ggplot2)
-library(magrittr)
 library(sf)
 
-# 1. 初始化与参数定义
+# 1. 路径设置
 rm(list = ls())
-gc()
+shp_path <- "E:/zou/30m/fish.shp"
+output_shp <- "E:/zou/30m/水量平衡/水量平衡结果.shp"
+output_stats <- "E:/zou/30m/水量平衡/水量平衡统计.csv"
+dir.create(dirname(output_shp), showWarnings = FALSE)
 
-# 2. 数据加载与预处理
+# 2. 数据加载与检查
 message("加载数据...")
-# 加载包含et和pre_wgs字段的shp文件
-shp_data <- st_read("E:/zou/Marxan/数据/渔网/pulayer.shp")
-
-# 检查shp文件是否包含所需的字段
-if (!all(c("et", "pre_wgs") %in% names(shp_data))) {
-  stop("shp文件必须包含'et'和'pre_wgs'字段")
+shp_data <- st_read(shp_path, quiet = TRUE)
+required_fields <- c("pre30", "wgs30", "et30", "wgsdeepth")
+missing_fields <- setdiff(required_fields, names(shp_data))
+if (length(missing_fields) > 0) {
+  stop("错误：缺少字段 - ", paste(missing_fields, collapse = ", "))
 }
 
-# 3. 计算水分平衡状态（PRE_WGS - ET/10）
-calculate_water_balance <- function(shp_data) {
-  # 创建数据副本
-  result_shp <- shp_data
-  
-  # 计算ET/10
-  result_shp$et_div10 <- result_shp$et / 10
-  
-  # 计算 PRE_WGS - ET/10
-  result_shp$water_balance_diff <- result_shp$pre_wgs - result_shp$et_div10
-  
-  # 计算水分平衡状态
-  result_shp$water_status <- ifelse(
-    result_shp$water_balance_diff < 100, 1L,  # 水分匮缺：差值 < 100
-    ifelse(result_shp$water_balance_diff > 120, 2L, 3L)  # 水分盈余：差值 > 120，平衡：100-120之间
+# 3. 核心计算（确保所有水量平衡关系字段都被创建）
+message("计算水量平衡关系...")
+result <- shp_data
+
+# 3.1 基础指标计算（全部保留在SHP中）
+result$gw_multiplier <- ifelse(result$wgsdeepth > 0 & result$wgsdeepth < 10, 1, 0)
+result$weighted_gw <- result$wgs30 * result$gw_multiplier  # 加权后地下水
+result$pre_minus_gw <- result$pre30 - result$weighted_gw    # 降雨-加权地下水
+result$pre_vs_et <- ifelse(result$pre30 > result$et30, "降雨>ET", "降雨≤ET")  # 降雨与ET关系
+result$gw_et_relation <- ifelse(
+  result$pre_minus_gw < result$et30, 
+  "(降雨-地下水)<ET", 
+  "(降雨-地下水)≥ET"
+)  # 降雨-地下水与ET的关系
+
+# 3.2 水量平衡分类（数字代码+文字描述）
+result$balance_code <- ifelse(
+  result$pre30 > result$et30, 3L,
+  ifelse(result$pre_minus_gw < result$et30, 1L, 2L)
+)
+result$balance_class <- factor(
+  result$balance_code,
+  levels = c(1, 2, 3),
+  labels = c("匮缺区", "平衡区", "盈余区")
+)
+
+# 4. 数据清洗
+valid_rows <- complete.cases(st_drop_geometry(result[, required_fields]))
+valid_data <- result[valid_rows, ]
+total_valid <- nrow(valid_data)
+total_all <- nrow(result)
+message(sprintf("有效数据：%d 个（总数据：%d 个）", total_valid, total_all))
+
+# 5. 统计分析
+stats <- as.data.table(valid_data)[, .(
+  要素数量 = .N,
+  占比 = round(.N / total_valid, 4)
+), by = .(balance_code, balance_class)]
+setorder(stats, balance_code)
+
+# 6. 导出结果（确保所有字段都被保存）
+message("导出SHP文件（包含完整水量平衡关系字段）...")
+# 强制保存所有计算字段，避免自动精简
+st_write(result, output_shp, delete_dsn = TRUE, quiet = FALSE)
+fwrite(stats, output_stats, encoding = "UTF-8")
+
+# 7. 确认SHP文件包含的字段
+shp_fields <- names(result)
+cat("\n===== 导出的SHP文件包含以下水量平衡相关字段：=====\n")
+print(shp_fields[shp_fields %in% c(
+  "gw_multiplier", "weighted_gw", "pre_minus_gw",
+  "pre_vs_et", "gw_et_relation", "balance_code", "balance_class"
+)])
+
+message("\n结果保存成功：")
+message("- SHP文件路径：", output_shp)
+message("- 统计表格路径：", output_stats)
+
+message("生成空间分布地图...")
+p_map <- ggplot() +
+  geom_sf(data = valid_data, aes(fill = balance_class), color = NA, alpha = 0.8) +
+  scale_fill_manual(
+    values = c("#E74C3C", "#F39C12", "#27AE60"),
+    name = "水量平衡分类"
+  ) +
+  labs(
+    title = "沿黄岸线水量平衡空间分布",
+    subtitle = "基于 (降雨-加权地下水) 与 ET 的关系分类"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    legend.position = "bottom"
   )
-  
-  # 添加状态描述字段
-  result_shp$status_desc <- factor(
-    result_shp$water_status,
-    levels = c(1, 2, 3),
-    labels = c("水分匮缺", "水分盈余", "水分平衡")
-  )
-  
-  return(result_shp)
-}
-
-# 4. 执行分析与输出
-message("开始计算水分平衡...")
-result_shp <- calculate_water_balance(shp_data)
-
-# 移除NA值
-valid_data <- result_shp[complete.cases(result_shp$et, result_shp$pre_wgs), ]
-
-# 统计与可视化
-if (nrow(valid_data) > 0) {
-  # 转换为数据表进行统计
-  result_dt <- as.data.table(valid_data)
-  
-  # 基本统计
-  balance_stats <- result_dt[, .(
-    要素数量 = .N,
-    占比 = .N/nrow(result_dt),
-    平均ET = mean(et, na.rm = TRUE),
-    平均ET_div10 = mean(et_div10, na.rm = TRUE),
-    平均PRE_WGS = mean(pre_wgs, na.rm = TRUE),
-    平均水分差值 = mean(water_balance_diff, na.rm = TRUE),
-    最小差值 = min(water_balance_diff, na.rm = TRUE),
-    最大差值 = max(water_balance_diff, na.rm = TRUE)
-  ), by = .(status = status_desc)]
-  
-  # 可视化1：水分平衡状态比例
-  p1 <- ggplot(balance_stats, aes(x = status, y = 占比, fill = status)) +
-    geom_col() +
-    scale_fill_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A")) +
-    labs(title = "沿黄岸线水分平衡状况分布", 
-         subtitle = "基于 PRE_WGS - ET/10 的差值判断",
-         x = "水分平衡状态", y = "比例") +
-    theme_minimal() +
-    geom_text(aes(label = paste0(round(占比 * 100, 1), "%")), 
-              position = position_stack(vjust = 0.5), size = 5)
-  
-  print(p1)
-  
-  # 可视化2：水分差值分布直方图
-  p2 <- ggplot(result_dt, aes(x = water_balance_diff, fill = status_desc)) +
-    geom_histogram(bins = 30, alpha = 0.7) +
-    geom_vline(xintercept = c(100, 120), linetype = "dashed", color = "red") +
-    scale_fill_manual(values = c("#E41A1C", "#377EB8", "#4DAF4A"),
-                      name = "水分状态") +
-    labs(title = "水分差值分布直方图 (PRE_WGS - ET/10)",
-         x = "水分差值", y = "频数") +
-    theme_minimal() +
-    annotate("text", x = 50, y = max(table(cut(result_dt$water_balance_diff, 30))), 
-             label = "匮缺区\n<100", color = "red", size = 4) +
-    annotate("text", x = 140, y = max(table(cut(result_dt$water_balance_diff, 30))), 
-             label = "盈余区\n>120", color = "red", size = 4)
-  
-  print(p2)
-  
-  # 保存带有结果字段的shp文件
-  message("正在保存结果到shp文件...")
-  st_write(result_shp, "沿黄岸线水分平衡结果.shp", delete_dsn = TRUE)
-  
-  # 保存统计结果
-  fwrite(balance_stats, "水分平衡统计.csv")
-  
-  message("分析完成！")
-  message(sprintf("总共处理了 %d 个要素", nrow(result_shp)))
-  message(sprintf("有效数据 %d 个要素", nrow(valid_data)))
-  
-  # 输出详细统计信息
-  cat("\n=== 水分平衡状态统计 ===\n")
-  stats_summary <- result_dt[, .(
-    数量 = .N,
-    比例 = paste0(round(.N/nrow(result_dt)*100, 1), "%"),
-    平均ET = round(mean(et), 2),
-    平均ET_div10 = round(mean(et_div10), 2),
-    平均PRE_WGS = round(mean(pre_wgs), 2),
-    平均水分差值 = round(mean(water_balance_diff), 2),
-    差值范围 = paste0(round(min(water_balance_diff), 1), " - ", round(max(water_balance_diff), 1))
-  ), by = .(状态 = status_desc)]
-  
-  print(stats_summary)
-  
-  # 整体统计
-  overall_stats <- result_dt[, .(
-    总要素数 = nrow(result_shp),
-    有效要素数 = nrow(valid_data),
-    水分匮缺数量 = sum(water_status == 1),
-    水分盈余数量 = sum(water_status == 2),
-    水分平衡数量 = sum(water_status == 3),
-    水分匮缺比例 = paste0(round(sum(water_status == 1) / nrow(valid_data) * 100, 1, "%"),
-    水分盈余比例 = paste0(round(sum(water_status == 2) / nrow(valid_data) * 100, 1), "%"),
-    水分平衡比例 = paste0(round(sum(water_status == 3) / nrow(valid_data) * 100, 1), "%"),
-    整体平均差值 = round(mean(water_balance_diff), 2)
-  )]
-  
-  cat("\n=== 整体水分平衡状况 ===\n")
-  print(overall_stats)
-  
-  fwrite(overall_stats, "整体水分平衡统计.csv")
-  
-  # 输出判断阈值信息（统一改为120）
-  cat("\n=== 判断阈值 ===\n")
-  cat("水分匮缺区: PRE_WGS - ET/10 < 100\n")
-  cat("水分平衡区: 100 ≤ PRE_WGS - ET/10 ≤ 120\n")
-  cat("水分盈余区: PRE_WGS - ET/10 > 120\n")
-  
-  # 输出shp文件字段信息
-  cat("\n=== 输出shp文件字段信息 ===\n")
-  cat("新增字段：\n")
-  cat("- et_div10: ET值除以10的结果\n")
-  cat("- water_balance_diff: PRE_WGS - ET/10 的差值\n")
-  cat("- water_status: 水分状态（1=匮缺，2=盈余，3=平衡）\n")
-  cat("- status_desc: 状态描述\n")
-  
-} else {
-  message("没有找到有效的ET和PRE_WGS数据")
-  st_write(result_shp, "沿黄岸线水分平衡结果.shp", delete_dsn = TRUE)
-  message("已保存shp文件，但部分字段可能包含NA值")
-}
-
-# 5. 输出文件信息
-message("\n=== 输出文件信息 ===")
-message("1. 沿黄岸线水分平衡结果.shp - 包含水分平衡分析结果的shapefile")
-message("2. 水分平衡统计.csv - 详细的统计信息")
-message("3. 整体水分平衡统计.csv - 整体统计信息")
-
-# 显示结果示例
-if (nrow(valid_data) > 0) {
-  cat("\n=== 前6个要素的结果示例 ===\n")
-  print(head(as.data.frame(valid_data)[, c("et", "et_div10", "pre_wgs", "water_balance_diff", "water_status", "status_desc")]))
-}
+ggsave(paste0(output_plots, "水量平衡空间分布.png"), p_map, 
+       width = 10, height = 8, dpi = 300)
+print(p_map)
