@@ -1,0 +1,134 @@
+# 土壤可蚀性因子计算（碳酸钙为0，粉粒/100）
+library(raster)
+library(sf)
+library(dplyr)
+
+## 定义主处理函数
+process_soil_data <- function(sand_path, clay_path, silt_path, oc_path, 
+                              vector_path, output_dir) {
+  # 创建输出目录
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+    message(paste("已创建输出目录:", output_dir))
+  }
+  
+  # 创建临时目录
+  temp_dir <- file.path(output_dir, "temp")
+  if (!dir.exists(temp_dir)) {
+    dir.create(temp_dir)
+  }
+  
+  # 临时文件路径
+  sand_temp <- file.path(temp_dir, "sand_cropped.tif")
+  clay_temp <- file.path(temp_dir, "clay_cropped.tif")
+  silt_temp <- file.path(temp_dir, "silt_cropped.tif")  # 粉粒数据
+  oc_temp <- file.path(temp_dir, "oc_cropped.tif")
+  om_temp <- file.path(temp_dir, "om_calculated.tif")
+  
+  tryCatch({
+    ## 1. 裁剪输入栅格（包含粉粒数据）
+    message("裁剪输入栅格数据...")
+    sand_cropped <- clip_raster_with_vector(sand_path, vector_path, sand_temp)
+    clay_cropped <- clip_raster_with_vector(clay_path, vector_path, clay_temp)
+    silt_cropped <- clip_raster_with_vector(silt_path, vector_path, silt_temp)  # 粉粒裁剪
+    oc_cropped <- clip_raster_with_vector(oc_path, vector_path, oc_temp)
+    
+    ## 2. 单位转换（核心调整）
+    message("单位转换...")
+    sand <- sand_cropped / 100  # 砂粒/100
+    clay <- clay_cropped / 100  # 黏粒/100
+    silt <- silt_cropped / 100  # 粉粒/100（按需求调整）
+    oc <- oc_cropped / 1000     # 有机碳/1000
+    caco3 <- 0  # 碳酸钙为0（全局设置为0）
+    
+    ## 3. 转换OC为OM
+    message("计算有机质OM...")
+    om_calculated <- oc * 1.724
+    writeRaster(om_calculated, om_temp, format = "GTiff", overwrite = TRUE)
+    
+    ## 4. 计算EF（完整公式，碳酸钙项为0）
+    message("计算EF...")
+    EF_result <- calculate_EF(
+      sand_raster = sand,
+      silt_raster = silt,
+      clay_raster = clay,
+      om_raster = om_calculated,
+      caco3_raster = caco3  # 传入0
+    )
+    EF_output <- file.path(output_dir, "EF_result.tif")
+    writeRaster(EF_result, EF_output, format = "GTiff", overwrite = TRUE)
+    
+    ## 5. 计算SCF
+    message("计算SCF...")
+    SCF_result <- calculate_SCF(clay, om_calculated)
+    SCF_output <- file.path(output_dir, "SCF_result.tif")
+    writeRaster(SCF_result, SCF_output, format = "GTiff", overwrite = TRUE)
+    
+    message(paste0("处理完成！结果已保存到: ", normalizePath(output_dir)))
+    
+    return(list(
+      EF_path = EF_output,
+      SCF_path = SCF_output
+    ))
+  }, finally = {
+    ## 清理临时文件
+    if (dir.exists(temp_dir)) {
+      unlink(temp_dir, recursive = TRUE)
+      message("临时文件已清理")
+    }
+  })
+}
+
+## 辅助函数：裁剪栅格
+clip_raster_with_vector <- function(raster_path, vector_path, output_path) {
+  raster_data <- raster(raster_path)
+  vector_data <- st_read(vector_path, quiet = TRUE) %>% 
+    st_transform(crs = crs(raster_data))
+  
+  cropped <- crop(raster_data, vector_data)
+  masked <- mask(cropped, vector_data)
+  writeRaster(masked, output_path, format = "GTiff", overwrite = TRUE)
+  return(masked)
+}
+
+## 辅助函数：计算EF（含粉粒，碳酸钙为0）
+calculate_EF <- function(sand_raster, silt_raster, clay_raster, om_raster, caco3_raster) {
+  # 检查栅格匹配性（碳酸钙为0时无需检查其栅格）
+  if (!compareRaster(sand_raster, silt_raster, clay_raster, om_raster, stopiffalse = FALSE)) {
+    stop("输入栅格不匹配（砂粒、粉粒、黏粒、OM需同范围和分辨率）")
+  }
+  # 公式：EF = [29.09 + 0.31·Sa + 0.17·Si + 0.33(Sa/Cl) - 2.59·OM - 0.95·0]/100
+  ef <- (29.09 + 0.31 * sand_raster + 0.17 * silt_raster + 
+           0.33 * (sand_raster / clay_raster) - 2.59 * om_raster) / 100  # 移除碳酸钙项（因=0）
+  return(ef)
+}
+
+## 辅助函数：计算SCF
+calculate_SCF <- function(clay_raster, om_raster) {
+  if (!compareRaster(clay_raster, om_raster, stopiffalse = FALSE)) {
+    stop("输入栅格不匹配")
+  }
+  return(1 / (1 + 0.0066 * (clay_raster^2) + 0.021 * (om_raster^2)))
+}
+
+## 示例使用（更新粉粒路径和输出目录）
+sand_path <- "E:/zou/风蚀量/土壤数据/sand_0-5cm_90m.tif"       # 砂粒数据
+clay_path <- "E:/zou/风蚀量/土壤数据/clay_0-5cm_90m.tif"       # 黏粒数据
+silt_path <- "E:/zou/风蚀量/土壤数据/silt_0-5cm_90m.tif"       # 粉粒数据（新增）
+oc_path <- "E:/zou/风蚀量/土壤数据/OC_0-5cm_90m.tif"           # 有机碳数据
+vector_path <- "E:/zou/data/LU/New_Shapefile.shp"               # 研究区矢量
+output_dir <- "E:/zou/风蚀量/可蚀性因子/scf重计算"              # 输出目录
+
+# 运行处理流程
+results <- process_soil_data(
+  sand_path = sand_path,
+  clay_path = clay_path,
+  silt_path = silt_path,  # 传入粉粒数据
+  oc_path = oc_path,
+  vector_path = vector_path,
+  output_dir = output_dir
+)
+
+# 打印结果路径
+print(paste("EF结果已保存到:", results$EF_path))
+print(paste("SCF结果已保存到:", results$SCF_path))
