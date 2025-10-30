@@ -90,51 +90,86 @@ writeRaster(result$raster, "水分平衡结果.tif", overwrite = TRUE)
 fwrite(balance_stats, "水分平衡统计.csv")
 message("分析完成！")
 
-////shp是写水量平衡
-# 水量平衡分析（确保SHP文件包含完整关系字段）
-# 分类标准：
-# - 1：匮缺区：(pre30 - weighted_gw) < et30
-# - 2：平衡区：其他情况
-# - 3：盈余区：pre30 > et30
+////shp是写水量平衡----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# 水量平衡分析（修正投影转换错误）
 library(terra)
-library(data.table)
 library(sf)
+library(data.table)
+library(ggplot2)
 
 # 1. 路径设置
 rm(list = ls())
-shp_path <- "E:/zou/30m/fish.shp"
+shp_path <- "E:/zou/30m/sixfish.shp"       # 矢量数据路径
+gw_depth_tif <- "E:/zou/30m/投影/wgsdeepth10.tif"  # 地下水埋深栅格路径
 output_shp <- "E:/zou/30m/水量平衡/水量平衡结果.shp"
 output_stats <- "E:/zou/30m/水量平衡/水量平衡统计.csv"
+output_plots <- "E:/zou/30m/水量平衡/"
 dir.create(dirname(output_shp), showWarnings = FALSE)
+dir.create(output_plots, showWarnings = FALSE)
 
-# 2. 数据加载与检查
-message("加载数据...")
+# 2. 数据加载与投影匹配（核心修复部分）
+message("加载数据并匹配投影...")
+# 加载矢量数据并获取原始CRS
 shp_data <- st_read(shp_path, quiet = TRUE)
-required_fields <- c("pre30", "wgs30", "et30", "wgsdeepth")
+original_crs_sf <- st_crs(shp_data)  # 获取sf格式的CRS（用于矢量）
+original_crs_terra <- crs(vect(shp_data))  # 转换为terra兼容的CRS格式（用于栅格）
+message("原始矢量投影：", original_crs_sf$input)
+
+# 检查必要字段
+required_fields <- c("pre", "wgs", "et")
 missing_fields <- setdiff(required_fields, names(shp_data))
 if (length(missing_fields) > 0) {
-  stop("错误：缺少字段 - ", paste(missing_fields, collapse = ", "))
+  stop("矢量数据缺少字段：", paste(missing_fields, collapse = ", "))
 }
 
-# 3. 核心计算（确保所有水量平衡关系字段都被创建）
-message("计算水量平衡关系...")
+# 加载栅格数据并转换投影（关键修复：使用terra兼容的CRS）
+gw_rast <- rast(gw_depth_tif)
+if (!file.exists(gw_depth_tif)) {
+  stop("栅格文件不存在：", gw_depth_tif)
+}
+message("栅格原始投影：", crs(gw_rast))
+
+# 转换栅格投影为与矢量一致（使用terra的crs格式避免错误）
+gw_rast <- project(gw_rast, original_crs_terra)
+message("栅格已转换为与矢量一致的投影：", crs(gw_rast))
+
+# 3. 提取栅格数据到矢量，创建deepwgs字段
+message("提取栅格数据到矢量，创建deepwgs字段...")
+calc_mode <- function(x, na.rm = TRUE) {
+  if (na.rm) x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  tab <- table(x)
+  if (length(tab) == 1) return(as.numeric(names(tab)))
+  if (tab[1] == tab[2]) return(1)  # 平局时默认1（10m以内）
+  return(as.numeric(names(tab)[which.max(tab)]))
+}
+
+# 提取栅格值到矢量（基于匹配后的投影）
+extracted <- extract(
+  x = gw_rast,
+  y = vect(shp_data),  # 转换为terra的vect格式用于提取
+  fun = calc_mode,
+  na.rm = TRUE
+)
+if (nrow(extracted) != nrow(shp_data)) {
+  stop("栅格提取结果行数与矢量不匹配！矢量：", nrow(shp_data), "，提取：", nrow(extracted))
+}
+shp_data$deepwgs <- extracted[, 2]
+shp_data$deepwgs[is.na(shp_data$deepwgs)] <- 0  # NA填充为0（>10m）
+message("deepwgs字段创建成功，共", length(shp_data$deepwgs), "个值（0=>10m，1=≤10m）")
+
+# 4. 核心水量平衡计算
+message("开始水量平衡计算...")
 result <- shp_data
 
-# 3.1 基础指标计算（全部保留在SHP中）
-result$gw_multiplier <- ifelse(result$wgsdeepth > 0 & result$wgsdeepth < 10, 1, 0)
-result$weighted_gw <- result$wgs30 * result$gw_multiplier  # 加权后地下水
-result$pre_minus_gw <- result$pre30 - result$weighted_gw    # 降雨-加权地下水
-result$pre_vs_et <- ifelse(result$pre30 > result$et30, "降雨>ET", "降雨≤ET")  # 降雨与ET关系
-result$gw_et_relation <- ifelse(
-  result$pre_minus_gw < result$et30, 
-  "(降雨-地下水)<ET", 
-  "(降雨-地下水)≥ET"
-)  # 降雨-地下水与ET的关系
+# 4.1 基础指标计算
+result$weighted_gw <- result$wgs * result$deepwgs
+result$pre_minus_gw <- result$pre - result$weighted_gw
 
-# 3.2 水量平衡分类（数字代码+文字描述）
+# 4.2 水量平衡分类
 result$balance_code <- ifelse(
-  result$pre30 > result$et30, 3L,
-  ifelse(result$pre_minus_gw < result$et30, 1L, 2L)
+  result$pre > result$et, 3L,
+  ifelse(result$pre_minus_gw < result$et, 1L, 2L)
 )
 result$balance_class <- factor(
   result$balance_code,
@@ -142,55 +177,32 @@ result$balance_class <- factor(
   labels = c("匮缺区", "平衡区", "盈余区")
 )
 
-# 4. 数据清洗
+# 5. 数据清洗与统计
 valid_rows <- complete.cases(st_drop_geometry(result[, required_fields]))
 valid_data <- result[valid_rows, ]
 total_valid <- nrow(valid_data)
-total_all <- nrow(result)
-message(sprintf("有效数据：%d 个（总数据：%d 个）", total_valid, total_all))
+message("有效数据：", total_valid, "个（总数据：", nrow(result), "个）")
 
-# 5. 统计分析
 stats <- as.data.table(valid_data)[, .(
   要素数量 = .N,
   占比 = round(.N / total_valid, 4)
 ), by = .(balance_code, balance_class)]
 setorder(stats, balance_code)
 
-# 6. 导出结果（确保所有字段都被保存）
-message("导出SHP文件（包含完整水量平衡关系字段）...")
-# 强制保存所有计算字段，避免自动精简
+# 6. 导出结果（保持原始投影）
+message("导出结果...")
 st_write(result, output_shp, delete_dsn = TRUE, quiet = FALSE)
 fwrite(stats, output_stats, encoding = "UTF-8")
 
-# 7. 确认SHP文件包含的字段
-shp_fields <- names(result)
-cat("\n===== 导出的SHP文件包含以下水量平衡相关字段：=====\n")
-print(shp_fields[shp_fields %in% c(
-  "gw_multiplier", "weighted_gw", "pre_minus_gw",
-  "pre_vs_et", "gw_et_relation", "balance_code", "balance_class"
-)])
-
-message("\n结果保存成功：")
-message("- SHP文件路径：", output_shp)
-message("- 统计表格路径：", output_stats)
-
-message("生成空间分布地图...")
+# 7. 生成空间分布图
 p_map <- ggplot() +
   geom_sf(data = valid_data, aes(fill = balance_class), color = NA, alpha = 0.8) +
-  scale_fill_manual(
-    values = c("#E74C3C", "#F39C12", "#27AE60"),
-    name = "水量平衡分类"
-  ) +
-  labs(
-    title = "沿黄岸线水量平衡空间分布",
-    subtitle = "基于 (降雨-加权地下水) 与 ET 的关系分类"
-  ) +
+  scale_fill_manual(values = c("#E74C3C", "#F39C12", "#27AE60"), name = "水量平衡分类") +
+  labs(title = "水量平衡空间分布", subtitle = "基于降雨、地下水与ET的关系") +
   theme_minimal() +
-  theme(
-    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
-    plot.subtitle = element_text(hjust = 0.5, size = 11),
-    legend.position = "bottom"
-  )
-ggsave(paste0(output_plots, "水量平衡空间分布.png"), p_map, 
-       width = 10, height = 8, dpi = 300)
-print(p_map)
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "bottom")
+ggsave(paste0(output_plots, "水量平衡分布.png"), p_map, width = 10, height = 8, dpi = 300)
+
+message("所有操作完成！结果投影与原始矢量一致：", st_crs(result)$input)
+message("结果SHP：", output_shp)
+message("统计表格：", output_stats)
