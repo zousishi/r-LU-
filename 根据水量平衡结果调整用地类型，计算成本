@@ -1,0 +1,178 @@
+# 用地类型栅格投影至矢量坐标并可视化（保留所有用地类型）
+library(dplyr)        # 数据处理
+library(ggplot2)      # 可视化
+library(terra)        # 栅格处理
+library(sf)           # 矢量处理
+library(tibble)       # 数据格式转换
+
+# 1. 路径设置
+rm(list = ls())
+vector_path <- "E:/zou/30m/水量平衡/水量平衡结果.shp"  # 矢量数据
+landtype_tif <- "E:/zou/30m/投影/re岸线LU植被.tif"  # 用地类型TIFF
+output_vector <- "E:/zou/30m/水量平衡/adjusted_land_vector.shp"
+output_stats <- "E:/zou/30m/水量平衡/landtype_et_cost_stats.csv"
+output_landtype_map <- "E:/zou/30m/水量平衡/投影后用地类型分布图.png"
+
+# 2. 数据加载与强制投影
+message("加载数据并统一投影...")
+
+# 加载矢量数据并获取其坐标系（WKT格式）
+if (!file.exists(vector_path)) {
+  stop("矢量文件不存在：", vector_path)
+}
+vector_sf <- st_read(vector_path, quiet = TRUE)
+vector_crs_wkt <- st_as_text(st_crs(vector_sf))  # 矢量WKT格式
+message("矢量坐标系（WKT）：", substr(vector_crs_wkt, 1, 100))
+
+# 加载用地类型栅格
+landtype_rast <- rast(landtype_tif)
+if (!file.exists(landtype_tif)) {
+  stop("用地类型TIFF不存在：", landtype_tif)
+}
+landtype_crs_text <- as.character(crs(landtype_rast))  # 栅格坐标系
+message("原始栅格坐标系：", substr(landtype_crs_text, 1, 100))
+
+# 强制将栅格投影至矢量坐标系
+message("将用地类型栅格投影至矢量坐标系...")
+landtype_rast_proj <- project(landtype_rast, vector_crs_wkt)
+proj_crs_text <- as.character(crs(landtype_rast_proj))
+message("投影后栅格坐标系：", substr(proj_crs_text, 1, 100))
+
+# 3. 提取投影后的用地类型到矢量（存入lu字段，保留所有类型）
+calc_mode <- function(x, na.rm = TRUE) {
+  if (na.rm) x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  tab <- table(x)
+  if (length(tab) == 1) return(as.numeric(names(tab)))
+  if (max(tab) == min(tab)) return(as.numeric(names(tab)[1]))
+  return(as.numeric(names(tab)[which.max(tab)]))
+}
+
+message("从投影后的栅格提取用地类型（保留所有类型）...")
+extracted_lu <- extract(
+  x = landtype_rast_proj,
+  y = vect(vector_sf),
+  fun = calc_mode,
+  na.rm = TRUE
+)
+vector_sf$lu <- extracted_lu[, 2]  # 保留所有用地类型（包括1、6、7）
+
+# 4. 显示投影后的用地类型空间分布图（包含所有类型）
+message("绘制投影后的用地类型图...")
+vector_centers <- st_centroid(vector_sf)  # 计算中心点
+vector_coords <- st_coordinates(vector_centers)
+
+vector_df <- vector_sf %>%
+  st_drop_geometry() %>%
+  mutate(
+    x = vector_coords[, 1],
+    y = vector_coords[, 2]
+  )
+
+p_landtype <- ggplot(vector_df, aes(x = x, y = y, color = factor(lu))) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_color_discrete(name = "用地类型（含1、6、7）") +  # 标注包含所有类型
+  labs(
+    title = "投影后用地类型空间分布",
+    subtitle = paste("坐标系：", substr(vector_crs_wkt, 1, 50)),
+    x = "X坐标",
+    y = "Y坐标"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+ggsave(output_landtype_map, p_landtype, width = 12, height = 10, dpi = 300)
+print(p_landtype)
+
+# 5. 用地类型调整与成本计算（保留所有类型，仅对2/3/4/5/8调整）
+# 不筛选类型，保留所有lu（包括1、6、7）
+vector_all <- vector_sf  # 不再过滤，保留所有类型
+
+# 计算所有原始用地类型（含1、6、7）的平均ET
+landtype_et_mean <- vector_all %>%
+  st_drop_geometry() %>%
+  group_by(lu) %>%  # 基于所有类型计算
+  summarise(mean_et = mean(et, na.rm = TRUE)) %>%
+  rename(LU2 = lu)  # 与调整后类型匹配
+
+# 用地类型调整规则（仅对2/3/4/5/8生效，1/6/7保持不变）
+adjust_land_type <- function(water_balance, current_land, et, et_threshold) {
+  case_when(
+    # 仅对2/3/4/5/8执行调整，其他类型（1、6、7）直接返回原始值
+    current_land %in% c(2, 3, 4, 5, 8) & water_balance == 1 ~ case_when(
+      current_land == 2 ~ 3,
+      current_land == 3 ~ 4,
+      current_land == 5 ~ 8,
+      current_land == 8 ~ 8,
+      current_land == 4 ~ 5,
+      TRUE ~ current_land
+    ),
+    current_land %in% c(2, 3, 4, 5, 8) & water_balance == 3 & et > et_threshold ~ case_when(
+      current_land == 3 ~ 2,
+      current_land == 4 ~ 3,
+      current_land == 8 ~ 5,
+      current_land == 2 ~ 2,
+      current_land == 5 ~ 4,
+      TRUE ~ current_land
+    ),
+    TRUE ~ current_land  # 1、6、7及其他类型不调整
+  )
+}
+
+# 计算ET阈值（基于2/3/4/5/8中et>5的记录，不影响1/6/7）
+et_threshold <- vector_all %>%
+  st_drop_geometry() %>%
+  filter(lu %in% c(2, 3, 4, 5, 8), et > 5) %>%  # 仅用需调整的类型计算阈值
+  pull(et) %>%
+  mean(na.rm = TRUE)
+
+# 执行调整，LU2为调整后类型（1、6、7保持不变）
+vector_adjusted <- vector_all %>%
+  mutate(
+    LU2 = adjust_land_type(
+      water_balance = pr_mns_,
+      current_land = lu,  # 基于所有类型（含1、6、7）
+      et = et,
+      et_threshold = et_threshold
+    )
+  )
+
+# 赋予cost字段，保留所有类型
+vector_with_cost <- vector_adjusted %>%
+  left_join(landtype_et_mean, by = "LU2") %>%  # 关联所有类型的平均ET
+  rename(
+    cost = mean_et,
+    original_lu = lu
+  ) %>%
+  mutate(
+    cost = ifelse(is.na(cost), et, cost),  # 1、6、7的cost用原始et填充（若未计算平均）
+    lu = original_lu  # 恢复原始类型（含1、6、7）
+  ) %>%
+  select(-original_lu)
+
+# 6. 保存结果（包含所有用地类型）
+output_dir <- dirname(output_vector)
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+st_write(vector_with_cost, output_vector, delete_dsn = TRUE, quiet = FALSE)
+
+# 统计所有类型（含1、6、7）的成本
+cost_stats <- vector_with_cost %>%
+  st_drop_geometry() %>%
+  group_by(LU2) %>%  # 按调整后类型统计（含1、6、7）
+  summarise(
+    样本数量 = n(),
+    平均cost = mean(cost, na.rm = TRUE),
+    cost标准差 = sd(cost, na.rm = TRUE)
+  )
+write.csv(cost_stats, output_stats, row.names = FALSE, fileEncoding = "UTF-8")
+
+message("所有操作完成！")
+message("投影后用地类型图：", output_landtype_map)
+message("结果矢量包含所有用地类型（含1、6、7），字段：", paste(names(vector_with_cost), collapse = ", "))
+message("结果矢量路径：", output_vector)
