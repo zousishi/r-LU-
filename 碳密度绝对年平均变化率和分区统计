@@ -1,0 +1,371 @@
+# 碳密度年平均变化率加载必要的R包
+library(terra)
+library(tidyverse)
+
+# 1. 读取TIFF数据
+tif_files <- list.files("D:/小论文/数据/土壤soc密度/处理后碳密度数据", pattern = "\\.tif$", full.names = TRUE)
+carbon_stack <- rast(tif_files)
+
+# 查看原始数据信息
+cat("=== 原始数据信息 ===\n")
+print(carbon_stack)
+cat("时期数量:", nlyr(carbon_stack), "\n\n")
+
+# 2. 计算相邻两期之间的变化率（逐像元计算）
+cat("=== 开始计算相邻时期变化率（逐像元）===\n")
+num_periods <- nlyr(carbon_stack)
+change_rates_list <- list()
+
+for(i in 1:(num_periods - 1)) {
+  change_rate <- (carbon_stack[[i+1]] - carbon_stack[[i]]) / 5
+  change_rates_list[[i]] <- change_rate
+  cat("已计算相邻变化率: 时期", i, "-> 时期", i+1, "\n")
+}
+
+# 将列表中的变化率栅格合并为一个新的SpatRaster
+change_rates_stack <- rast(change_rates_list)
+
+# 设置更清晰的图层名称
+period_names <- c("95-00", "00-05", "05-10", "10-15", "15-20")
+change_names <- paste0("Change_", period_names[1:4], "_to_", period_names[2:5])
+names(change_rates_stack) <- change_names
+
+# 查看变化率栅格堆叠的基本信息
+cat("\n=== 相邻时期变化率图层信息 ===\n")
+print(change_rates_stack)
+cat("相邻变化率图层数量:", nlyr(change_rates_stack), "\n")
+
+# 3. 计算1995-2020年整体变化率（修复并行计算错误）
+cat("\n=== 开始计算1995-2020年整体变化率 ===\n")
+
+# 方法1：将年份中点作为参数传递给app函数（推荐）
+year_midpoints <- c(1997.5, 2002.5, 2007.5, 2012.5, 2017.5)
+cat("使用的年份中点:", year_midpoints, "\n")
+
+# 定义计算函数，将year_midpoints作为参数
+calc_slope_fixed <- function(x, years = year_midpoints) {
+  if (any(is.na(x))) return(NA)
+  if (length(x) != length(years)) return(NA)
+  model <- lm(x ~ years)
+  return(coef(model)[2])
+}
+
+cat("正在进行逐像元线性回归计算...\n")
+
+# 方法1A：不使用并行计算（最稳定）
+cat("使用方法1: 顺序计算（稳定）\n")
+overall_change_rate <- app(carbon_stack, calc_slope_fixed)
+names(overall_change_rate) <- "Overall_ChangeRate_1995_2020"
+
+# 如果数据很大需要并行，使用方法1B：
+# cat("使用方法1B: 并行计算\n")
+# overall_change_rate <- app(carbon_stack, calc_slope_fixed, cores = 4)
+
+cat("整体变化率计算完成！\n")
+
+# 4. 可视化结果
+cat("\n=== 生成可视化结果 ===\n")
+
+# 绘制相邻时期变化率
+cat("正在绘制相邻时期变化率图...\n")
+for(i in 1:nlyr(change_rates_stack)) {
+  plot(change_rates_stack[[i]], 
+       main = paste("相邻时期变化率:", names(change_rates_stack)[i]),
+       sub = "单位: Mgha⁻¹ yr⁻¹")
+}
+
+# 绘制整体变化率
+cat("正在绘制整体变化率图...\n")
+plot(overall_change_rate, 
+     main = "1995-2020年整体变化率（逐像元线性回归）",
+     sub = "单位: Mgha⁻¹ yr⁻¹")
+
+# 5. 保存结果栅格
+cat("\n=== 保存结果文件 ===\n")
+
+# 保存相邻时期变化率
+output_dir_adjacent <- "相邻变化率结果/"
+if(!dir.exists(output_dir_adjacent)) dir.create(output_dir_adjacent)
+
+for(i in 1:nlyr(change_rates_stack)) {
+  output_file <- file.path(output_dir_adjacent, paste0(names(change_rates_stack)[i], ".tif"))
+  writeRaster(change_rates_stack[[i]], filename = output_file, overwrite = TRUE)
+  cat("已保存相邻变化率:", output_file, "\n")
+}
+
+# 保存整体变化率
+output_dir_overall <- "整体变化率结果/"
+if(!dir.exists(output_dir_overall)) dir.create(output_dir_overall)
+
+overall_output_file <- file.path(output_dir_overall, "Overall_ChangeRate_1995_2020.tif")
+writeRaster(overall_change_rate, filename = overall_output_file, overwrite = TRUE)
+cat("已保存整体变化率:", overall_output_file, "\n")
+
+# 6. 详细结果统计摘要
+cat("\n=== 详细统计摘要 ===\n")
+
+# 相邻时期变化率统计
+cat("--- 相邻时期变化率统计 ---\n")
+change_summary <- data.frame(
+  时期转换 = names(change_rates_stack),
+  平均值 = round(global(change_rates_stack, "mean", na.rm = TRUE)[,1], 4),
+  标准差 = round(global(change_rates_stack, "sd", na.rm = TRUE)[,1], 4),
+  最小值 = round(global(change_rates_stack, "min", na.rm = TRUE)[,1], 4),
+  最大值 = round(global(change_rates_stack, "max", na.rm = TRUE)[,1], 4),
+  像元数量 = round(global(change_rates_stack, "notNA", na.rm = TRUE)[,1], 0)
+)
+print(change_summary)
+
+# 整体变化率统计
+cat("\n--- 1995-2020年整体变化率统计 ---\n")
+overall_stats <- data.frame(
+  指标 = c("平均值", "标准差", "最小值", "最大值", "有效像元数"),
+  数值 = c(
+    round(global(overall_change_rate, "mean", na.rm = TRUE)[1,1], 4),
+    round(global(overall_change_rate, "sd", na.rm = TRUE)[1,1], 4),
+    round(global(overall_change_rate, "min", na.rm = TRUE)[1,1], 4),
+    round(global(overall_change_rate, "max", na.rm = TRUE)[1,1], 4),
+    round(global(overall_change_rate, "notNA", na.rm = TRUE)[1,1], 0)
+  )
+)
+print(overall_stats)
+
+# 7. 验证结果
+cat("\n=== 结果验证 ===\n")
+cat("相邻变化率图层数:", nlyr(change_rates_stack), "\n")
+cat("整体变化率图层数:", nlyr(overall_change_rate), "\n")
+cat("计算完成！所有变化率均已保存。\n")
+
+
+
+# 高效版的末期地类分区统计方案------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+library(terra)
+library(tidyverse)
+
+# ============================================
+# 配置
+# ============================================
+
+# 用地类型编码
+landuse_classification <- data.frame(
+  landuse_code = c(1, 2, 3, 4, 5, 6),
+  landuse_type = c("耕地", "林地", "草地", "水域", "建设用地", "未利用地")
+)
+
+# 分析配置
+analysis_config <- data.frame(
+  change_file = c("D:/小论文/数据/土壤soc密度/处理后碳密度数据/绝对相邻变化率结果/Change_95-00_to_00-05.tif",
+                  "D:/小论文/数据/土壤soc密度/处理后碳密度数据/绝对相邻变化率结果/Change_00-05_to_05-10.tif",
+                  "D:/小论文/数据/土壤soc密度/处理后碳密度数据/绝对相邻变化率结果/Change_05-10_to_10-15.tif", 
+                  "D:/小论文/数据/土壤soc密度/处理后碳密度数据/绝对相邻变化率结果/Change_10-15_to_15-20.tif",
+                  "D:/小论文/数据/土壤soc密度/处理后碳密度数据/绝对相邻变化率结果/Overall_ChangeRate_1995_2020.tif"),
+  landuse_file = c("D:/小论文/数据/用地类型图/30m/投影/reclass/2005.tif",
+                   "D:/小论文/数据/用地类型图/30m/投影/reclass/2010.tif",
+                   "D:/小论文/数据/用地类型图/30m/投影/reclass/2015.tif", 
+                   "D:/小论文/数据/用地类型图/30m/投影/reclass/2020.tif",
+                   "D:/小论文/数据/用地类型图/30m/投影/reclass/2020.tif"),
+  period_name = c("1995-2000→2000-2005", "2000-2005→2005-2010",
+                  "2005-2010→2010-2015", "2010-2015→2015-2020", 
+                  "1995-2020整体变化")
+)
+
+# ============================================
+# 高效分析函数
+# ============================================
+
+# 快速提取有效像元数据
+fast_extract_data <- function(change_file, landuse_file, period_name) {
+  cat("处理:", period_name, "\n")
+  
+  # 读取数据
+  change_raster <- rast(change_file)
+  landuse_raster <- rast(landuse_file)
+  
+  # 快速重采样
+  landuse_resampled <- resample(landuse_raster, change_raster, method = "near")
+  
+  # 创建掩码（只处理有效像元）
+  valid_mask <- !is.na(change_raster) & !is.na(landuse_resampled)
+  
+  # 提取有效像元坐标
+  valid_cells <- which(values(valid_mask) == 1)
+  
+  if (length(valid_cells) == 0) {
+    cat("  无有效像元\n")
+    return(NULL)
+  }
+  
+  # 批量提取数据
+  change_vals <- values(change_raster)[valid_cells]
+  landuse_vals <- values(landuse_resampled)[valid_cells]
+  
+  # 获取坐标（可选，如果不需要坐标可以注释掉以加快速度）
+  coords <- xyFromCell(change_raster, valid_cells)
+  
+  # 创建数据框
+  result <- data.frame(
+    x = coords[,1],
+    y = coords[,2],
+    change_rate = change_vals,
+    landuse_code = landuse_vals,
+    period = period_name,
+    landuse_year = tools::file_path_sans_ext(basename(landuse_file))
+  )
+  
+  cat("  有效像元:", nrow(result), "\n")
+  return(result)
+}
+
+# 主分析函数
+perform_fast_analysis <- function() {
+  all_data <- list()
+  
+  for (i in 1:nrow(analysis_config)) {
+    change_file <- analysis_config$change_file[i]
+    landuse_file <- analysis_config$landuse_file[i]
+    period_name <- analysis_config$period_name[i]
+    
+    # 检查文件存在性
+    if (!file.exists(change_file) || !file.exists(landuse_file)) {
+      cat("跳过: 文件不存在 -", period_name, "\n")
+      next
+    }
+    
+    # 处理数据
+    period_data <- fast_extract_data(change_file, landuse_file, period_name)
+    
+    if (!is.null(period_data)) {
+      all_data[[period_name]] <- period_data
+    }
+    
+    cat("\n")
+  }
+  
+  # 合并数据
+  if (length(all_data) == 0) {
+    stop("没有成功处理任何数据")
+  }
+  
+  combined_data <- bind_rows(all_data) %>%
+    left_join(landuse_classification, by = "landuse_code") %>%
+    filter(!is.na(landuse_type))
+  
+  cat("=== 数据汇总 ===\n")
+  cat("总有效像元数:", nrow(combined_data), "\n")
+  cat("分析时期数:", n_distinct(combined_data$period), "\n")
+  cat("用地类型数:", n_distinct(combined_data$landuse_type), "\n")
+  
+  return(combined_data)
+}
+
+# 快速统计函数
+fast_generate_stats <- function(combined_data) {
+  cat("生成统计报告...\n")
+  
+  # 使用data.table加速（如果数据量大）
+  if (nrow(combined_data) > 1000000) {
+    library(data.table)
+    combined_dt <- as.data.table(combined_data)
+    
+    detailed_stats <- combined_dt[
+      , .(n = .N,
+          mean = round(mean(change_rate, na.rm = TRUE), 4),
+          median = round(median(change_rate, na.rm = TRUE), 4),
+          sd = round(sd(change_rate, na.rm = TRUE), 4),
+          min = round(min(change_rate, na.rm = TRUE), 4),
+          max = round(max(change_rate, na.rm = TRUE), 4),
+          q25 = round(quantile(change_rate, 0.25, na.rm = TRUE), 4),
+          q75 = round(quantile(change_rate, 0.75, na.rm = TRUE), 4)
+      ), 
+      by = .(period, landuse_type)
+    ] %>% as.data.frame()
+    
+    carbon_stats <- combined_dt[
+      , .(n_pixels = .N,
+          mean_change = round(mean(change_rate, na.rm = TRUE), 4),
+          median_change = round(median(change_rate, na.rm = TRUE), 4)
+      ), 
+      by = .(landuse_type)
+    ] %>% 
+      as.data.frame() %>%
+      mutate(
+        carbon_role = ifelse(mean_change > 0, "碳汇", "碳源"),
+        role_strength = case_when(
+          abs(mean_change) > 2 ~ "强",
+          abs(mean_change) > 1 ~ "中等",
+          TRUE ~ "弱"
+        )
+      ) %>%
+      arrange(desc(mean_change))
+    
+  } else {
+    # 使用dplyr（数据量较小时）
+    detailed_stats <- combined_data %>%
+      group_by(period, landuse_type) %>%
+      summarise(
+        n = n(),
+        mean = round(mean(change_rate, na.rm = TRUE), 4),
+        median = round(median(change_rate, na.rm = TRUE), 4),
+        sd = round(sd(change_rate, na.rm = TRUE), 4),
+        min = round(min(change_rate, na.rm = TRUE), 4),
+        max = round(max(change_rate, na.rm = TRUE), 4),
+        q25 = round(quantile(change_rate, 0.25, na.rm = TRUE), 4),
+        q75 = round(quantile(change_rate, 0.75, na.rm = TRUE), 4),
+        .groups = 'drop'
+      )
+    
+    carbon_stats <- combined_data %>%
+      group_by(landuse_type) %>%
+      summarise(
+        n_pixels = n(),
+        mean_change = round(mean(change_rate, na.rm = TRUE), 4),
+        median_change = round(median(change_rate, na.rm = TRUE), 4),
+        .groups = 'drop'
+      ) %>%
+      mutate(
+        carbon_role = ifelse(mean_change > 0, "碳汇", "碳源"),
+        role_strength = case_when(
+          abs(mean_change) > 2 ~ "强",
+          abs(mean_change) > 1 ~ "中等",
+          TRUE ~ "弱"
+        )
+      ) %>%
+      arrange(desc(mean_change))
+  }
+  
+  return(list(detailed = detailed_stats, carbon = carbon_stats))
+}
+
+# ============================================
+# 执行分析
+# ============================================
+
+cat("开始执行高效分析...\n")
+start_time <- Sys.time()
+
+final_data <- perform_fast_analysis()
+
+processing_time <- Sys.time() - start_time
+cat("数据处理时间:", round(processing_time, 2), "秒\n")
+
+stats <- fast_generate_stats(final_data)
+
+# 保存结果
+write.csv(stats$detailed, "末期地类统计_分组统计.csv", row.names = FALSE, fileEncoding = "UTF-8")
+write.csv(stats$carbon, "末期地类统计_碳汇碳源.csv", row.names = FALSE, fileEncoding = "UTF-8")
+
+total_time <- Sys.time() - start_time
+cat("\n✅ 分析完成！总耗时:", round(total_time, 2), "秒\n")
+
+cat("输出文件:\n")
+cat("- 末期地类统计_详细数据.csv\n") 
+cat("- 末期地类统计_分组统计.csv\n")
+cat("- 末期地类统计_碳汇碳源.csv\n")
+
+# 显示关键结果
+cat("\n=== 碳汇/碳源地类识别 ===\n")
+print(stats$carbon)
+
+cat("\n=== 数据概况 ===\n")
+cat("总像元数:", nrow(final_data), "\n")
+cat("数据大小:", format(object.size(final_data), units = "MB"), "\n")
