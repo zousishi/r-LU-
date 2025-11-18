@@ -1,4 +1,174 @@
-# 碳密度年平均变化率加载必要的R包
+#有机碳密度处理
+library(terra)
+library(purrr)
+
+# ----------------------
+# 1. 定义多期数据路径与参数
+# ----------------------
+periods <- c("SOCD95_00albers", "SOCD00_05albers", "SOCD05_10albers", "SOCD10_15albers", "SOCD15_20albers")
+data_dir <- "D:/小论文/数据/土壤soc密度/投影0_100/"
+file_paths <- paste0(data_dir, periods, ".tif")
+
+# 检查文件是否存在
+cat("检查文件存在性：\n")
+for(i in 1:length(file_paths)) {
+  cat(basename(file_paths[i]), ":", file.exists(file_paths[i]), "\n")
+}
+
+if (!all(file.exists(file_paths))) {
+  missing_files <- file_paths[!file.exists(file_paths)]
+  stop("以下文件不存在，请检查：\n", paste(missing_files, collapse="\n"))
+} else {
+  cat("✅ 所有文件都存在，继续执行...\n")
+}
+
+# ----------------------
+# 2. 批量读取并统一投影/分辨率 - 添加数据缩放处理
+# ----------------------
+ref_raster <- rast(file_paths[1])
+crs_ref <- crs(ref_raster)
+res_ref <- res(ref_raster)
+
+cat("参考栅格信息：\n")
+cat("投影：", crs_ref, "\n")
+cat("分辨率：", res_ref, "\n")
+cat("范围：", as.character(ext(ref_raster)), "\n")
+
+# 修改：添加数据缩放处理的函数
+read_standardize_and_scale <- function(path) {
+  cat("正在处理：", basename(path), "\n")
+  r <- rast(path)
+  
+  # 重要：将数据除以1000，还原为真实碳密度值
+  cat("  - 数据缩放：除以1000还原真实值\n")
+  r <- r / 1000
+  
+  # 检查投影一致性
+  if (!identical(crs(r), crs_ref)) {
+    cat("  - 投影不一致，正在转换...\n")
+    r <- project(r, crs_ref, method="bilinear")
+  }
+  
+  # 检查分辨率一致性
+  if (!identical(res(r), res_ref)) {
+    cat("  - 分辨率不一致，正在重采样...\n")
+    r <- resample(r, ref_raster, method="bilinear")
+  }
+  
+  return(r)
+}
+
+# 应用修改后的函数读取所有数据
+cat("\n开始读取、标准化和缩放数据...\n")
+carbon_list <- map(file_paths, read_standardize_and_scale)
+names(carbon_list) <- periods
+
+# ----------------------
+# 3. 批量过滤无效值（≤0→NoData）
+# ----------------------
+filter_invalid <- function(raster) {
+  return(ifel(raster <= 0, NA, raster))
+}
+
+cat("\n过滤无效值（≤0）...\n")
+carbon_filtered <- map(carbon_list, filter_invalid)
+
+# 统计各期处理后的有效像元数
+valid_pixels_per_period <- map_dbl(carbon_filtered, function(r) {
+  global(!is.na(r), sum, na.rm=TRUE)[[1]]
+})
+
+cat("=== 各期无效值处理后有效像元数 ===\n")
+print(data.frame(时期=periods, 有效像元数=valid_pixels_per_period))
+
+# ----------------------
+# 4. 计算多期共同有效像元（所有期均非NoData）
+# ----------------------
+cat("\n计算多期共同有效像元...\n")
+mask_list <- map(carbon_filtered, function(r) !is.na(r))
+common_valid_mask <- reduce(mask_list, `&`)
+
+# 统计共同有效像元数量及占比
+total_pixels <- ncell(ref_raster)
+common_valid_count <- global(common_valid_mask, sum, na.rm=TRUE)[[1]]
+common_valid_ratio <- round(common_valid_count / total_pixels * 100, 2)
+
+cat("\n=== 多期数据像元匹配统计 ===\n")
+cat("总像元数：", total_pixels, "\n")
+cat("所有期均有效的像元数：", common_valid_count, "（占比：", common_valid_ratio, "%）\n")
+cat("至少一期无效的像元数：", total_pixels - common_valid_count, "\n")
+
+# ----------------------
+# 5. 应用共同掩码，保留多期一致有效的像元
+# ----------------------
+cat("\n应用共同掩码...\n")
+carbon_final <- map(carbon_filtered, function(r) {
+  mask(r, common_valid_mask)
+})
+
+# 验证：各期最终有效像元数应相等
+final_valid_check <- map_dbl(carbon_final, function(r) {
+  global(!is.na(r), sum, na.rm=TRUE)[[1]]
+})
+
+cat("\n=== 最终处理后各期有效像元数（应全部相等） ===\n")
+print(data.frame(时期=periods, 最终有效像元数=final_valid_check))
+
+# ----------------------
+# 6. 批量保存处理后的多期数据
+# ----------------------
+output_dir <- "D:/小论文/数据/土壤soc密度/处理后碳密度数据/"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive=TRUE)
+  cat("创建输出目录：", output_dir, "\n")
+}
+
+# 批量保存 - 添加单位说明
+cat("\n保存处理后的数据...\n")
+for(i in 1:length(carbon_final)) {
+  output_path <- paste0(output_dir, periods[i], "_final.tif")
+  writeRaster(carbon_final[[i]], output_path, overwrite=TRUE)
+  cat("已保存：", basename(output_path), "\n")
+}
+
+cat("\n✅ 所有期数据处理完成！已保存至：", output_dir, "\n")
+
+# ----------------------
+# 7. 最终数据验证 - 添加数据范围验证
+# ----------------------
+cat("\n=== 最终数据验证（已还原为真实碳密度值） ===\n")
+cat("数据说明：原始数据已除以1000，现在单位为真实碳密度值\n\n")
+
+final_stats <- map(carbon_final, function(r) {
+  stats <- global(r, c("min", "mean", "max", "sd"), na.rm=TRUE)
+  return(stats)
+})
+
+names(final_stats) <- periods
+
+# 输出统计结果并验证数据范围
+for(i in 1:length(final_stats)) {
+  cat("时期:", periods[i], "\n")
+  stats <- final_stats[[i]]
+  cat("  最小值:", round(stats$min, 2), "g/kg\n")
+  cat("  平均值:", round(stats$mean, 2), "g/kg\n") 
+  cat("  最大值:", round(stats$max, 2), "g/kg\n")
+  cat("  标准差:", round(stats$sd, 2), "g/kg\n")
+  
+  # 验证数据范围是否合理
+  if(stats$mean > 100) {
+    cat("  ⚠️  警告：平均值可能仍然偏大，请确认缩放因子\n")
+  }
+  cat("\n")
+}
+
+# 额外的数据质量检查
+cat("=== 数据质量检查 ===\n")
+cat("预期碳密度范围：典型土壤SOC密度在1-50 g/kg之间\n")
+cat("如果数值远超出此范围，请检查原始数据的单位和缩放因子\n")
+
+
+# 碳密度年平均变化率加载必要的R包-----------------------------___________----------------------------------------------------------------------------------------------------------------------------------
 library(terra)
 library(tidyverse)
 
