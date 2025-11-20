@@ -1,0 +1,579 @@
+library(terra)
+library(purrr)
+library(dplyr)
+
+# ----------------------
+# 第一部分：处理降雨量数据-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+# ----------------------
+
+# 设置路径和参数
+reference_raster_path <- "D:/小论文/数据/AI/AI/Albers2020AI.tif"
+precip_dir <- "D:/小论文/数据/AI/PRE_Peng/"
+output_dir <- "D:/小论文/数据/AI/结果/"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# 读取参考栅格
+cat("读取参考栅格...\n")
+ref_raster <- rast(reference_raster_path)
+
+cat("参考栅格信息：\n")
+cat("投影：", crs(ref_raster), "\n")
+cat("像元大小：", res(ref_raster), "\n")
+
+# 定义5年时期
+periods <- c("1995-1999", "2000-2004", "2005-2009", "2010-2014", "2015-2019", "2020-2024")
+period_years <- list(
+  "1995-1999" = 1995:1999,
+  "2000-2004" = 2000:2004,
+  "2005-2009" = 2005:2009,
+  "2010-2014" = 2010:2014,
+  "2015-2019" = 2015:2019,
+  "2020-2024" = 2020:2024
+)
+
+# 统一处理函数
+standardize_to_reference <- function(input_raster, reference_raster, data_type, period) {
+  cat("处理：", data_type, period, "\n")
+  
+  # 1. 投影转换
+  if (!identical(crs(input_raster), crs(reference_raster))) {
+    cat("  - 投影转换...\n")
+    input_raster <- project(input_raster, crs(reference_raster), method = "bilinear")
+  }
+  
+  # 2. 重采样到统一像元大小
+  if (!identical(res(input_raster), res(reference_raster))) {
+    cat("  - 重采样...\n")
+    input_raster <- resample(input_raster, reference_raster, method = "bilinear")
+  }
+  
+  # 3. 裁剪到参考范围
+  cat("  - 裁剪...\n")
+  input_raster <- crop(input_raster, ext(reference_raster))
+  input_raster <- mask(input_raster, reference_raster)
+  
+  # 4. 特殊处理：降雨量数据缩放
+  if (data_type == "降雨量") {
+    cat("  - 降雨量数据缩放：除以10还原真实值\n")
+    input_raster <- input_raster / 10
+  }
+  
+  return(input_raster)
+}
+
+# 读取并处理每年的降雨量数据
+cat("\n读取并处理每年的降雨量数据...\n")
+
+precip_annual_files <- list.files(precip_dir, pattern = "\\.tif$", full.names = TRUE)
+precip_annual_data <- list()
+
+# 创建输出目录
+precip_annual_dir <- paste0(output_dir, "降雨量逐年标准化/")
+dir.create(precip_annual_dir, recursive = TRUE)
+
+for (file in precip_annual_files) {
+  # 从文件名中提取年份
+  year_match <- regmatches(file, regexpr("\\d{4}", file))
+  if (length(year_match) > 0) {
+    year <- as.numeric(year_match)
+    if (year >= 1995 && year <= 2024) {
+      cat("读取降雨量数据：", basename(file), "\n")
+      precip_raw <- rast(file)
+      precip_standardized <- standardize_to_reference(
+        precip_raw, ref_raster, "降雨量", as.character(year)
+      )
+      
+      # 保存标准化后的逐年数据
+      output_path <- paste0(precip_annual_dir, "precip_std_", year, ".tif")
+      writeRaster(precip_standardized, output_path, overwrite = TRUE)
+      cat("  已保存：", basename(output_path), "\n")
+      
+      precip_annual_data[[as.character(year)]] <- precip_standardized
+    }
+  }
+}
+
+cat("\n✅ 第一部分完成：降雨量数据处理完成！\n")
+cat("标准化后的逐年数据保存在：", precip_annual_dir, "\n")
+
+
+library(terra)
+library(purrr)
+library(dplyr)
+
+# ----------------------
+# 第二部分：计算降雨量5年平均值-------------------------------------------------------------------------------------------------------------------------------------------------------
+# ----------------------
+
+# 设置路径
+reference_raster_path <- "D:/小论文/数据/AI/AI/Albers2020AI.tif"
+output_dir <- "D:/小论文/数据/AI/结果/"
+precip_annual_dir <- paste0(output_dir, "降雨量逐年标准化/")
+
+# 读取参考栅格
+cat("读取参考栅格...\n")
+ref_raster <- rast(reference_raster_path)
+
+# 定义5年时期
+periods <- c("1995-1999", "2000-2004", "2005-2009", "2010-2014", "2015-2019", "2020-2024")
+period_years <- list(
+  "1995-1999" = 1995:1999,
+  "2000-2004" = 2000:2004,
+  "2005-2009" = 2005:2009,
+  "2010-2014" = 2010:2014,
+  "2015-2019" = 2015:2019,
+  "2020-2024" = 2020:2024
+)
+
+# 读取标准化后的逐年降雨量数据
+cat("\n读取标准化后的逐年降雨量数据...\n")
+
+precip_annual_data <- list()
+precip_annual_files <- list.files(precip_annual_dir, pattern = "\\.tif$", full.names = TRUE)
+
+for (file in precip_annual_files) {
+  year_match <- regmatches(file, regexpr("\\d{4}", file))
+  if (length(year_match) > 0) {
+    year <- as.numeric(year_match)
+    cat("读取标准化降雨量数据：", basename(file), "\n")
+    precip_annual_data[[as.character(year)]] <- rast(file)
+  }
+}
+
+# 计算5年平均值函数
+calculate_period_mean <- function(annual_data_list, years, period_name) {
+  cat("计算", period_name, "的降雨量平均值...\n")
+  
+  period_rasters <- list()
+  for (year in years) {
+    year_str <- as.character(year)
+    if (!is.null(annual_data_list[[year_str]])) {
+      period_rasters <- c(period_rasters, annual_data_list[[year_str]])
+    }
+  }
+  
+  if (length(period_rasters) > 0) {
+    # 将所有年份数据堆叠并计算平均值
+    period_stack <- rast(period_rasters)
+    period_mean <- app(period_stack, mean, na.rm = TRUE)
+    names(period_mean) <- period_name
+    return(period_mean)
+  } else {
+    cat("警告：", period_name, "没有可用的数据\n")
+    return(NULL)
+  }
+}
+
+# 计算各时期的5年平均值
+cat("\n计算降雨量5年平均值...\n")
+
+precip_period_means <- list()
+
+for (period in periods) {
+  years <- period_years[[period]]
+  precip_period_means[[period]] <- calculate_period_mean(
+    precip_annual_data, years, paste0("Precip_", period)
+  )
+}
+
+# 保存5年平均降雨量数据
+cat("\n保存5年平均降雨量数据...\n")
+
+precip_mean_dir <- paste0(output_dir, "降雨量5年平均/")
+dir.create(precip_mean_dir, recursive = TRUE)
+
+for (period in periods) {
+  if (!is.null(precip_period_means[[period]])) {
+    output_path <- paste0(precip_mean_dir, "precip_mean_", period, ".tif")
+    writeRaster(precip_period_means[[period]], output_path, overwrite = TRUE)
+    cat("已保存：", basename(output_path), "\n")
+    
+    # 验证数据
+    precip_vals <- values(precip_period_means[[period]])
+    precip_vals <- precip_vals[!is.na(precip_vals)]
+    cat("  ", period, "数值范围：", round(min(precip_vals), 1), "-", round(max(precip_vals), 1), "mm\n")
+  }
+}
+
+cat("\n✅ 第二部分完成：降雨量5年平均值计算完成！\n")
+cat("5年平均数据保存在：", precip_mean_dir, "\n")
+
+
+library(terra)
+library(purrr)
+library(dplyr)
+
+# ----------------------
+# 第三部分：处理潜在蒸发散数据--------------------------------------------------------------------------------------------------------------------------------------------------------
+# ----------------------
+
+# 设置路径和参数
+reference_raster_path <- "D:/小论文/数据/AI/AI/Albers2020AI.tif"
+pet_dir <- "D:/小论文/数据/AI/PET逐年/"
+output_dir <- "D:/小论文/数据/AI/结果/"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# 读取参考栅格
+cat("读取参考栅格...\n")
+ref_raster <- rast(reference_raster_path)
+
+# 定义5年时期
+periods <- c("1995-1999", "2000-2004", "2005-2009", "2010-2014", "2015-2019", "2020-2024")
+period_years <- list(
+  "1995-1999" = 1995:1999,
+  "2000-2004" = 2000:2004,
+  "2005-2009" = 2005:2009,
+  "2010-2014" = 2010:2014,
+  "2015-2019" = 2015:2019,
+  "2020-2024" = 2020:2024
+)
+
+# 统一处理函数
+standardize_to_reference <- function(input_raster, reference_raster, data_type, period) {
+  cat("处理：", data_type, period, "\n")
+  
+  # 1. 投影转换
+  if (!identical(crs(input_raster), crs(reference_raster))) {
+    cat("  - 投影转换...\n")
+    input_raster <- project(input_raster, crs(reference_raster), method = "bilinear")
+  }
+  
+  # 2. 重采样到统一像元大小
+  if (!identical(res(input_raster), res(reference_raster))) {
+    cat("  - 重采样...\n")
+    input_raster <- resample(input_raster, reference_raster, method = "bilinear")
+  }
+  
+  # 3. 裁剪到参考范围
+  cat("  - 裁剪...\n")
+  input_raster <- crop(input_raster, ext(reference_raster))
+  input_raster <- mask(input_raster, reference_raster)
+  
+  return(input_raster)
+}
+
+# 读取并处理每年的潜在蒸发散数据
+cat("\n读取并处理每年的潜在蒸发散数据...\n")
+
+pet_annual_files <- list.files(pet_dir, pattern = "\\.tif$", full.names = TRUE)
+pet_annual_data <- list()
+
+# 创建输出目录
+pet_annual_dir <- paste0(output_dir, "潜在蒸发散逐年标准化/")
+dir.create(pet_annual_dir, recursive = TRUE)
+
+for (file in pet_annual_files) {
+  # 从文件名中提取年份
+  year_match <- regmatches(file, regexpr("\\d{4}", file))
+  if (length(year_match) > 0) {
+    year <- as.numeric(year_match)
+    if (year >= 1995 && year <= 2024) {
+      cat("读取潜在蒸发散数据：", basename(file), "\n")
+      pet_raw <- rast(file)
+      pet_standardized <- standardize_to_reference(
+        pet_raw, ref_raster, "潜在蒸发散", as.character(year)
+      )
+      
+      # 保存标准化后的逐年数据
+      output_path <- paste0(pet_annual_dir, "pet_std_", year, ".tif")
+      writeRaster(pet_standardized, output_path, overwrite = TRUE)
+      cat("  已保存：", basename(output_path), "\n")
+      
+      pet_annual_data[[as.character(year)]] <- pet_standardized
+    }
+  }
+}
+
+cat("\n✅ 第三部分完成：潜在蒸发散数据处理完成！\n")
+cat("标准化后的逐年数据保存在：", pet_annual_dir, "\n")
+
+
+library(terra)
+library(purrr)
+library(dplyr)
+
+# ----------------------
+# 第三部分补充：计算潜在蒸散发5年平均值-------------------------------------------------------------------------------------------------------------------------------------
+# ----------------------
+
+# 设置路径
+reference_raster_path <- "D:/小论文/数据/AI/AI/Albers2020AI.tif"
+output_dir <- "D:/小论文/数据/AI/结果/"
+pet_annual_dir <- paste0(output_dir, "潜在蒸发散逐年标准化/")
+
+# 读取参考栅格
+cat("读取参考栅格...\n")
+ref_raster <- rast(reference_raster_path)
+
+# 定义5年时期
+periods <- c("1995-1999", "2000-2004", "2005-2009", "2010-2014", "2015-2019", "2020-2024")
+period_years <- list(
+  "1995-1999" = 1995:1999,
+  "2000-2004" = 2000:2004,
+  "2005-2009" = 2005:2009,
+  "2010-2014" = 2010:2014,
+  "2015-2019" = 2015:2019,
+  "2020-2024" = 2020:2024
+)
+
+# 读取标准化后的逐年潜在蒸发散数据
+cat("\n读取标准化后的逐年潜在蒸发散数据...\n")
+
+pet_annual_data <- list()
+pet_annual_files <- list.files(pet_annual_dir, pattern = "\\.tif$", full.names = TRUE)
+
+for (file in pet_annual_files) {
+  year_match <- regmatches(file, regexpr("\\d{4}", file))
+  if (length(year_match) > 0) {
+    year <- as.numeric(year_match)
+    cat("读取标准化潜在蒸发散数据：", basename(file), "\n")
+    pet_annual_data[[as.character(year)]] <- rast(file)
+  }
+}
+
+# 计算5年平均值函数
+calculate_period_mean <- function(annual_data_list, years, period_name) {
+  cat("计算", period_name, "的潜在蒸发散平均值...\n")
+  
+  period_rasters <- list()
+  for (year in years) {
+    year_str <- as.character(year)
+    if (!is.null(annual_data_list[[year_str]])) {
+      period_rasters <- c(period_rasters, annual_data_list[[year_str]])
+    }
+  }
+  
+  if (length(period_rasters) > 0) {
+    # 将所有年份数据堆叠并计算平均值
+    period_stack <- rast(period_rasters)
+    period_mean <- app(period_stack, mean, na.rm = TRUE)
+    names(period_mean) <- period_name
+    return(period_mean)
+  } else {
+    cat("警告：", period_name, "没有可用的数据\n")
+    return(NULL)
+  }
+}
+
+# 计算各时期的5年平均值
+cat("\n计算潜在蒸发散5年平均值...\n")
+
+pet_period_means <- list()
+
+for (period in periods) {
+  years <- period_years[[period]]
+  pet_period_means[[period]] <- calculate_period_mean(
+    pet_annual_data, years, paste0("PET_", period)
+  )
+}
+
+# 保存5年平均潜在蒸发散数据
+cat("\n保存5年平均潜在蒸发散数据...\n")
+
+pet_mean_dir <- paste0(output_dir, "潜在蒸发散5年平均/")
+dir.create(pet_mean_dir, recursive = TRUE)
+
+for (period in periods) {
+  if (!is.null(pet_period_means[[period]])) {
+    output_path <- paste0(pet_mean_dir, "pet_mean_", period, ".tif")
+    writeRaster(pet_period_means[[period]], output_path, overwrite = TRUE)
+    cat("已保存：", basename(output_path), "\n")
+    
+    # 验证数据
+    pet_vals <- values(pet_period_means[[period]])
+    pet_vals <- pet_vals[!is.na(pet_vals)]
+    cat("  ", period, "数值范围：", round(min(pet_vals), 1), "-", round(max(pet_vals), 1), "mm\n")
+  }
+}
+
+cat("\n✅ 第三部分补充完成：潜在蒸发散5年平均值计算完成！\n")
+cat("5年平均数据保存在：", pet_mean_dir, "\n")
+
+
+
+library(terra)
+library(purrr)
+library(dplyr)
+
+# ----------------------
+# 第四部分：计算干旱指数和分类------------------------------------------------------------------------------------------------------------------------------------------------
+# ----------------------
+
+# 设置路径
+reference_raster_path <- "D:/小论文/数据/AI/AI/Albers2020AI.tif"
+output_dir <- "D:/小论文/数据/AI/结果/"
+
+# 定义5年时期
+periods <- c("1995-1999", "2000-2004", "2005-2009", "2010-2014", "2015-2019", "2020-2024")
+period_years <- list(
+  "1995-1999" = 1995:1999,
+  "2000-2004" = 2000:2004,
+  "2005-2009" = 2005:2009,
+  "2010-2014" = 2010:2014,
+  "2015-2019" = 2015:2019,
+  "2020-2024" = 2020:2024
+)
+
+# 读取5年平均数据
+cat("读取5年平均数据...\n")
+
+precip_mean_dir <- paste0(output_dir, "降雨量5年平均/")
+pet_mean_dir <- paste0(output_dir, "潜在蒸发散5年平均/")
+
+precip_period_means <- list()
+pet_period_means <- list()
+
+for (period in periods) {
+  precip_file <- paste0(precip_mean_dir, "precip_mean_", period, ".tif")
+  pet_file <- paste0(pet_mean_dir, "pet_mean_", period, ".tif")
+  
+  if (file.exists(precip_file)) {
+    precip_period_means[[period]] <- rast(precip_file)
+    cat("读取降雨量平均值：", basename(precip_file), "\n")
+  }
+  
+  if (file.exists(pet_file)) {
+    pet_period_means[[period]] <- rast(pet_file)
+    cat("读取潜在蒸发散平均值：", basename(pet_file), "\n")
+  }
+}
+
+# 计算干旱指数
+cat("\n计算干旱指数（基于5年平均值）...\n")
+
+calculate_ai <- function(precip_raster, pet_raster, period_name) {
+  cat("计算干旱指数：", period_name, "\n")
+  
+  # AI = P / PET
+  ai_raster <- precip_raster / pet_raster
+  
+  # 处理无效值
+  ai_raster <- ifel(pet_raster == 0, NA, ai_raster)
+  ai_raster <- ifel(ai_raster < 0, NA, ai_raster)
+  ai_raster <- ifel(is.infinite(ai_raster), NA, ai_raster)
+  
+  names(ai_raster) <- paste0("AI_", period_name)
+  
+  return(ai_raster)
+}
+
+# 计算各时期干旱指数
+ai_rasters <- list()
+for (period in periods) {
+  if (!is.null(precip_period_means[[period]]) && !is.null(pet_period_means[[period]])) {
+    ai_rasters[[period]] <- calculate_ai(
+      precip_period_means[[period]], 
+      pet_period_means[[period]], 
+      period
+    )
+  }
+}
+
+# 干旱等级分类
+cat("\n进行干旱等级分类...\n")
+
+classify_aridity <- function(ai_raster, period_name) {
+  classified <- classify(ai_raster, 
+                         rcl = matrix(c(
+                           0, 0.03, 1,      # Hyper-arid
+                           0.03, 0.20, 2,   # Arid
+                           0.20, 0.50, 3,   # Semi-arid
+                           0.50, 0.65, 4,   # Sub-humid
+                           0.65, Inf, 5     # Humid
+                         ), ncol = 3, byrow = TRUE))
+  
+  levels(classified) <- data.frame(
+    id = 1:5,
+    class = c("Hyper-arid", "Arid", "Semi-arid", "Sub-humid", "Humid")
+  )
+  
+  names(classified) <- paste0("Aridity_Class_", period_name)
+  
+  return(classified)
+}
+
+# 对各时期进行干旱等级分类
+aridity_class_rasters <- map2(ai_rasters, periods, classify_aridity)
+
+# 保存结果数据
+cat("\n保存结果数据...\n")
+
+ai_output_dir <- paste0(output_dir, "干旱指数/")
+aridity_class_dir <- paste0(output_dir, "干旱等级/")
+dir.create(ai_output_dir, recursive = TRUE)
+dir.create(aridity_class_dir, recursive = TRUE)
+
+# 保存干旱指数数据
+for (period in periods) {
+  if (!is.null(ai_rasters[[period]])) {
+    output_path <- paste0(ai_output_dir, "AI_", period, ".tif")
+    writeRaster(ai_rasters[[period]], output_path, overwrite = TRUE)
+    cat("已保存：", basename(output_path), "\n")
+  }
+}
+
+# 保存干旱等级分类数据
+for (period in periods) {
+  if (!is.null(aridity_class_rasters[[period]])) {
+    output_path <- paste0(aridity_class_dir, "Aridity_Class_", period, ".tif")
+    writeRaster(aridity_class_rasters[[period]], output_path, overwrite = TRUE)
+    cat("已保存：", basename(output_path), "\n")
+  }
+}
+
+# 生成处理报告
+cat("\n生成处理报告...\n")
+
+processing_stats <- data.frame()
+
+for (period in periods) {
+  if (!is.null(precip_period_means[[period]]) && !is.null(pet_period_means[[period]])) {
+    precip_stats <- global(precip_period_means[[period]], c("min", "mean", "max"), na.rm = TRUE)
+    pet_stats <- global(pet_period_means[[period]], c("min", "mean", "max"), na.rm = TRUE)
+    ai_stats <- global(ai_rasters[[period]], c("min", "mean", "max"), na.rm = TRUE)
+    
+    # 干旱等级统计
+    class_values <- values(aridity_class_rasters[[period]])
+    class_values <- class_values[!is.na(class_values)]
+    class_counts <- table(class_values)
+    total_pixels <- length(class_values)
+    
+    stats_row <- data.frame(
+      时期 = period,
+      包含年份 = paste(period_years[[period]], collapse = ","),
+      降雨量最小值 = round(precip_stats$min, 2),
+      降雨量平均值 = round(precip_stats$mean, 2),
+      降雨量最大值 = round(precip_stats$max, 2),
+      潜在蒸发散最小值 = round(pet_stats$min, 2),
+      潜在蒸发散平均值 = round(pet_stats$mean, 2),
+      潜在蒸发散最大值 = round(pet_stats$max, 2),
+      干旱指数最小值 = round(ai_stats$min, 4),
+      干旱指数平均值 = round(ai_stats$mean, 4),
+      干旱指数最大值 = round(ai_stats$max, 4),
+      极干旱比例 = ifelse(1 %in% names(class_counts), round(class_counts[1]/total_pixels*100, 2), 0),
+      干旱比例 = ifelse(2 %in% names(class_counts), round(class_counts[2]/total_pixels*100, 2), 0),
+      半干旱比例 = ifelse(3 %in% names(class_counts), round(class_counts[3]/total_pixels*100, 2), 0),
+      半湿润比例 = ifelse(4 %in% names(class_counts), round(class_counts[4]/total_pixels*100, 2), 0),
+      湿润比例 = ifelse(5 %in% names(class_counts), round(class_counts[5]/total_pixels*100, 2), 0)
+    )
+    
+    processing_stats <- rbind(processing_stats, stats_row)
+  }
+}
+
+# 输出处理报告
+cat("\n=== 数据处理报告 ===\n")
+print(processing_stats)
+
+# 保存处理报告
+report_output <- paste0(output_dir, "5年平均干旱指数处理报告.csv")
+write.csv(processing_stats, report_output, row.names = FALSE, fileEncoding = "UTF-8")
+cat("已保存处理报告：", report_output, "\n")
+
+cat("\n✅ 第四部分完成：干旱指数计算和分类完成！\n")
+cat("处理流程总结：\n")
+cat("1. 第一部分：处理降雨量数据并保存逐年标准化数据\n")
+cat("2. 第二部分：计算降雨量5年平均值\n")
+cat("3. 第三部分：处理潜在蒸发散数据并保存逐年标准化数据\n")
+cat("4. 第四部分：计算干旱指数和进行干旱等级分类\n")
+cat("所有结果保存在：", output_dir, "\n")
