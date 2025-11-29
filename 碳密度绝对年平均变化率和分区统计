@@ -306,7 +306,197 @@ cat("相邻变化率图层数:", nlyr(change_rates_stack), "\n")
 cat("整体变化率图层数:", nlyr(overall_change_rate), "\n")
 cat("计算完成！所有变化率均已保存。\n")
 
+# 最小二乘法斜率计算socd变化加载所需包————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+library(terra)
+library(tidyverse)
 
+# ----------------------
+# 1. 读取TIFF数据
+# ----------------------
+tif_files <- list.files("D:/小论文/数据/土壤soc密度/处理后碳密度数据", pattern = "\\.tif$", full.names = TRUE)
+carbon_stack <- rast(tif_files)
+
+# 查看原始数据信息
+cat("=== 原始数据信息 ===\n")
+print(carbon_stack)
+cat("时期数量:", nlyr(carbon_stack), "\n\n")
+
+# 定义时期名称和年份中点
+period_names <- c("95-00", "00-05", "05-10", "10-15", "15-20")
+year_midpoints <- c(1997.5, 2002.5, 2007.5, 2012.5, 2017.5)
+names(carbon_stack) <- period_names
+
+# ----------------------
+# 2. 子时期划分（重叠划分，体现连续性）
+# ----------------------
+period1_indices <- 1:3  # 95-00, 00-05, 05-10（对应1995-2010）
+period2_indices <- 3:5  # 05-10, 10-15, 15-20（对应2005-2020）
+period1_years <- year_midpoints[period1_indices]
+period2_years <- year_midpoints[period2_indices]
+
+cat("子时期1索引:", period1_indices, "-> 时期:", period_names[period1_indices], " (1995-2010)\n")
+cat("子时期2索引:", period2_indices, "-> 时期:", period_names[period2_indices], " (2005-2020)\n")
+cat("重叠时期: 05-10 (2005-2010)\n")
+
+# 输出目录
+output_dir <- "D:/小论文/结果/碳密度变化率_完整分析/"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ----------------------
+# 3. 定义线性代数趋势分析函数（快速版本）
+# ----------------------
+matrix_trend_analysis <- function(carbon_stack, years) {
+  # 转换为矩阵
+  carbon_matrix <- values(carbon_stack)
+  n <- length(years)
+  
+  # 设计矩阵
+  X <- cbind(1, years)  # 截距项和年份
+  XtX_inv <- solve(t(X) %*% X)
+  mean_year <- mean(years)
+  ssx <- sum((years - mean_year)^2)
+  
+  # 批量计算所有像元的斜率和P值
+  results <- apply(carbon_matrix, 1, function(y) {
+    if (sum(!is.na(y)) < 3) return(c(NA, NA))
+    
+    valid <- !is.na(y)
+    y_valid <- y[valid]
+    X_valid <- X[valid, , drop = FALSE]
+    n_valid <- sum(valid)
+    
+    if (n_valid < 3) return(c(NA, NA))
+    
+    # 计算斜率
+    beta <- XtX_inv %*% t(X_valid) %*% y_valid
+    slope <- beta[2]
+    
+    # 计算标准误和P值
+    y_pred <- X_valid %*% beta
+    residuals <- y_valid - y_pred
+    rss <- sum(residuals^2)
+    se_slope <- sqrt(rss / (n_valid - 2)) / sqrt(ssx)
+    t_value <- slope / se_slope
+    p_value <- 2 * pt(abs(t_value), n_valid - 2, lower.tail = FALSE)
+    
+    c(slope, p_value)
+  })
+  
+  # 转换为矩阵
+  results_matrix <- t(results)
+  
+  # 创建结果栅格
+  slope_raster <- carbon_stack[[1]]
+  pvalue_raster <- carbon_stack[[1]]
+  
+  values(slope_raster) <- results_matrix[, 1]
+  values(pvalue_raster) <- results_matrix[, 2]
+  
+  return(c(slope_raster, pvalue_raster))
+}
+
+# ----------------------
+# 4. 整体时期（1995-2020）趋势分析 - 线性代数版本
+# ----------------------
+cat("\n=== 快速计算1995-2020年整体趋势（线性代数）===\n")
+system.time({
+  overall_trend <- matrix_trend_analysis(carbon_stack, year_midpoints)
+})
+
+# 分离斜率和P值图层
+overall_slope <- overall_trend[[1]]
+overall_pvalue <- overall_trend[[2]]
+names(overall_slope) <- "Overall_Slope_1995_2020"
+names(overall_pvalue) <- "Overall_Pvalue_1995_2020"
+
+cat("整体时期趋势分析完成\n")
+
+# ----------------------
+# 5. 子时期趋势分析 - 线性代数版本
+# ----------------------
+cat("\n=== 计算1995-2010年子时期趋势（线性代数）===\n")
+period1_stack <- carbon_stack[[period1_indices]]
+system.time({
+  period1_trend <- matrix_trend_analysis(period1_stack, period1_years)
+})
+period1_slope <- period1_trend[[1]]
+period1_pvalue <- period1_trend[[2]]
+names(period1_slope) <- "Period1_Slope_1995_2010"
+names(period1_pvalue) <- "Period1_Pvalue_1995_2010"
+
+cat("\n=== 计算2005-2020年子时期趋势（线性代数）===\n")
+period2_stack <- carbon_stack[[period2_indices]]
+system.time({
+  period2_trend <- matrix_trend_analysis(period2_stack, period2_years)
+})
+period2_slope <- period2_trend[[1]]
+period2_pvalue <- period2_trend[[2]]
+names(period2_slope) <- "Period2_Slope_2005_2020"
+names(period2_pvalue) <- "Period2_Pvalue_2005_2020"
+
+# ----------------------
+# 6. 计算转折点变化（新增分析）
+# ----------------------
+cat("\n=== 计算转折点变化（2005-2010时期的变化）===\n")
+# 计算两个子时期变化率的差异
+change_difference <- period2_slope - period1_slope
+names(change_difference) <- "Change_Difference_2005_2010"
+
+# 计算转折显著性（P值差异）
+change_significance <- ifel(period1_pvalue < 0.05 & period2_pvalue < 0.05, "both_sig",
+                           ifel(period1_pvalue < 0.05, "period1_sig",
+                                ifel(period2_pvalue < 0.05, "period2_sig", "both_nonsig")))
+names(change_significance) <- "Change_Significance_Pattern"
+
+# ----------------------
+# 7. 显著性分类
+# ----------------------
+cat("\n=== 生成显著性分类图 ===\n")
+
+# 使用数值编码进行显著性分类
+sig_class_numeric <- function(p) {
+  ifelse(is.na(p), NA,
+         ifelse(p < 0.01, 3,  # 极显著
+                ifelse(p < 0.05, 2,  # 显著
+                       1)))  # 不显著
+}
+
+overall_sig <- app(overall_pvalue, sig_class_numeric)
+period1_sig <- app(period1_pvalue, sig_class_numeric)
+period2_sig <- app(period2_pvalue, sig_class_numeric)
+
+names(overall_sig) <- "Overall_Significance_1995_2020"
+names(period1_sig) <- "Period1_Significance_1995_2010"
+names(period2_sig) <- "Period2_Significance_2005_2020"
+
+cat("显著性分类完成\n")
+
+# ----------------------
+# 8. 保存所有结果
+# ----------------------
+cat("\n=== 保存结果文件 ===\n")
+
+# 保存趋势分析结果
+output_dir_trend <- file.path(output_dir, "趋势分析结果/")
+if(!dir.exists(output_dir_trend)) dir.create(output_dir_trend)
+
+# 整体时期
+writeRaster(overall_slope, file.path(output_dir_trend, "整体变化率_1995_2020.tif"), overwrite = TRUE)
+writeRaster(overall_pvalue, file.path(output_dir_trend, "整体P值_1995_2020.tif"), overwrite = TRUE)
+writeRaster(overall_sig, file.path(output_dir_trend, "整体显著性_1995_2020.tif"), overwrite = TRUE)
+
+# 子时期1 (1995-2010)
+writeRaster(period1_slope, file.path(output_dir_trend, "子时期1变化率_1995_2010.tif"), overwrite = TRUE)
+writeRaster(period1_pvalue, file.path(output_dir_trend, "子时期1P值_1995_2010.tif"), overwrite = TRUE)
+writeRaster(period1_sig, file.path(output_dir_trend, "子时期1显著性_1995_2010.tif"), overwrite = TRUE)
+
+# 子时期2 (2005-2020)
+writeRaster(period2_slope, file.path(output_dir_trend, "子时期2变化率_2005_2020.tif"), overwrite = TRUE)
+writeRaster(period2_pvalue, file.path(output_dir_trend, "子时期2P值_2005_2020.tif"), overwrite = TRUE)
+writeRaster(period2_sig, file.path(output_dir_trend, "子时期2显著性_2005_2020.tif"), overwrite = TRUE)
+
+# 转折点分析结果
+writeRaster(change_difference, file.path(output_dir_t
 
 # 高效版的末期地类分区统计方案------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 library(terra)
