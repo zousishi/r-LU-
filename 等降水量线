@@ -1,0 +1,65 @@
+# 1. 加载库
+library(terra)
+library(sf)
+library(ggplot2)
+library(smoothr)
+library(RColorBrewer)
+
+# ----------------- 参数设置 -----------------
+# 建议先定义基础文件夹路径
+base_path <- "D:/小论文/数据/AI/结果"
+# 如果文件夹不存在则创建
+if (!dir.exists(base_path)) {
+  dir.create(base_path, recursive = TRUE)
+}
+
+tif_input <- file.path(base_path, "降雨量逐年标准化/precip_std_2020.tif")
+output_shp <- file.path(base_path, "等量线_平滑版_2020.shp")
+
+# 设定等值线数值 (请确保你的数据在这个范围内)
+target_breaks <- c(50, 200, 400, 600) 
+
+# ----------------- 步骤 1: 读取数据 -----------------
+r <- rast(tif_input)
+# 获取数据框（关键：这里我们给列起个固定的名字）
+m_df <- as.data.frame(r, xy = TRUE, na.rm = TRUE)
+# 强制命名列名：x, y, precip
+colnames(m_df) <- c("x", "y", "precip")
+
+# 检查范围
+r_minmax <- minmax(r)
+available_breaks <- target_breaks[target_breaks >= r_minmax[1] & target_breaks <= r_minmax[2]]
+
+# ----------------- 步骤 2: 提取并平滑等值线 -----------------
+if(length(available_breaks) > 0) {
+  # 提取
+  raw_contours <- as.contour(r, levels = available_breaks)
+  rain_lines_sf <- st_as_sf(raw_contours)
+  
+  # 平滑 (使用 chaikin 避免依赖新版 Rcpp)
+  rain_final <- smooth(rain_lines_sf, method = "chaikin", refinements = 3)
+  
+  # ----------------- 步骤 3: 保存文件 -----------------
+  # 确保路径正确
+  st_write(rain_final, output_shp, delete_dsn = TRUE, quiet = FALSE)
+  
+} else {
+  stop("无法提取等值线：目标数值不在栅格范围内。")
+}
+
+# ----------------- 步骤 4: 绘图 (修复报错部分) -----------------
+ggplot() +
+  # 绘制原栅格背景：直接引用数据框 m_df 里的 precip 列
+  geom_raster(data = m_df, aes(x = x, y = y, fill = precip)) +
+  
+  # 绘制平滑后的等值线
+  geom_sf(data = rain_final, aes(color = factor(level)), size = 1) +
+  
+  # 颜色调整
+  scale_fill_gradientn(colours = brewer.pal(9, "YlGnBu"), name = "降雨数值") +
+  scale_color_manual(values = c("50"="red", "200"="orange", "400"="blue", "600"="darkgreen"), 
+                     name = "等值线级") +
+  
+  theme_minimal() +
+  labs(title = "平滑且简化的等值线 (无交叉)", x = "经度", y = "纬度") +
+  theme(text = element_text(family = "SimSun")) # 如果中文乱码请加上这一行
